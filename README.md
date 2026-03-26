@@ -124,6 +124,8 @@ export SOURCE_BUCKET=my-source-bucket
 export DEST_BUCKET=my-backup-bucket
 export OPS_BUCKET_A=my-ops-a
 export OPS_BUCKET_B=my-ops-b
+export RESTORE_BUCKET_A=my-restore-bucket
+export RESTORE_BUCKET_B=my-restore-bucket-b
 ```
 
 ---
@@ -748,7 +750,9 @@ aws s3api get-bucket-metadata-configuration \
 
 ### 5.3 Athena 연동
 
-S3 Metadata 테이블은 AWS 관리형 테이블 버킷(`aws-s3`)에 Apache Iceberg 테이블로 저장됩니다. Athena로 쿼리하려면 테이블 버킷을 AWS 분석 서비스와 통합합니다:
+S3 Metadata 테이블은 AWS 관리형 테이블 버킷(`aws-s3`)에 Apache Iceberg 테이블로 저장됩니다. Athena로 쿼리하려면 테이블 버킷을 AWS 분석 서비스와 통합합니다.
+
+> **중요**: 이 단계를 **Account A와 Account B 모두**에서 수행하세요. Account B의 analytics integration은 Step 6.4의 재해 복구 시나리오에서 Account B의 메타데이터 테이블을 Account B의 Athena에서 직접 쿼리할 때 필요합니다.
 
 1. **S3 콘솔** → **Table buckets** → `aws-s3` 테이블 버킷 선택
 2. **Integrations**에서 **Enable integration with AWS analytics services** 선택
@@ -861,7 +865,7 @@ WHERE is_latest_version = TRUE
 ```
 
 **쿼리 해석:**
-- **Step 1** — `journal$properties`의 `oldest-uncoalesced-record-timestamp`가 inventory 스냅샷 종료 시점과 journal 레코드 시작 시점의 경계를 제공합니다.
+- **Step 1** — `journal$properties`의 `oldest-uncoalesced-record-timestamp`가 inventory 스냅샷 종료 시점과 journal 레코드 시작 시점의 경계를 제공합니다. 쿼리에 하드코딩된 `2024-12-01 00:00`은 fallback 기본값일 뿐입니다 — `COALESCE()`를 통해 `journal$properties`에서 실제 경계 시점을 자동으로 읽어오므로, 대부분의 경우 이 값을 변경할 필요가 없습니다. 만약 `journal$properties`에 아직 타임스탬프가 없는 경우(예: inventory backfill이 진행 중), fallback 값을 해당 버킷에 S3 Metadata를 활성화한 대략적인 시점으로 변경하세요.
 - **Step 2** — Inventory가 **모든 오브젝트**(S3 Metadata 이전 오브젝트 포함)의 기준선을 제공합니다. Journal은 inventory 경계 이후의 최근 변경분만 추가하며, 15분 오버랩 버퍼로 gap을 방지합니다.
 - **Step 3** — `PARTITION BY bucket, key, coalesce(version_id, '')`로 각 오브젝트 버전별 "version stack"을 구축합니다([AWS 문서 패턴](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-example-queries.html)). `LEAD()`로 다음 이벤트를 찾고, NULL이면 해당 버전의 최신 이벤트(tip)입니다.
 - **Step 4** — 영구 삭제된 버전(journal의 `record_type='DELETE'` + `is_delete_marker=FALSE`)을 제거합니다. Inventory 행(`record_type IS NULL`)은 항상 유지됩니다. 이렇게 하면 Lifecycle noncurrent version expiration이 현재 버전을 가리는 문제를 방지합니다.
@@ -973,35 +977,16 @@ Live inventory 테이블은 ~1시간 내에 갱신되며, Step 5.2에서 활성�
 
 인시던트 발생 시, 이 런북을 따라 특정 시점으로 데이터를 복원합니다.
 
+> **시작 전 확인**: 아래 예시는 PITR 대상 시점으로 `2024-07-15 14:00:00`을, S3 경로에 `2024-07-15T14`(예: `pitr-manifests/2024-07-15T14/`)을 사용합니다. 다른 시점으로 복원할 경우, SQL 쿼리의 `TIMESTAMP` 값 **과** bash 명령어의 S3 경로를 **모두** 대상 날짜에 맞게 변경하세요.
+
 ### 6.1 PITR Manifest 생성
 
-Athena의 `CREATE TABLE AS SELECT`(CTAS)로 쿼리 결과를 S3에 CSV manifest로 직접 내보냅니다.
+Athena에서 PITR 쿼리를 실행하고, 자동 생성되는 CSV 결과 파일을 manifest로 사용합니다. Athena는 모든 SELECT 결과를 워크그룹의 쿼리 결과 위치에 CSV 파일로 저장합니다.
 
-먼저 CTAS 출력용 Athena 데이터베이스를 생성합니다 (최초 1회):
-
-```sql
-CREATE DATABASE IF NOT EXISTS s3_inventory_db;
-```
-
-> **중요 — CTAS 출력 관련 두 가지 주의사항:**
->
-> 1. **다중 파일**: CTAS는 여러 파트 파일을 출력할 수 있습니다. S3 Batch Operations는 단일 manifest 파일을 요구합니다. CTAS 완료 후 파일을 합쳐야 합니다.
-> 2. **S3 키의 콤마**: CTAS TEXTFILE 포맷은 필드 값을 따옴표로 감싸지 않습니다. S3 키에 콤마가 포함된 경우(예: `data/file,v2.csv`) CSV가 깨집니다. 콤마가 포함된 키가 있을 수 있다면 탭 구분자(`field_delimiter = '\t'`)를 사용하고 Batch Operations manifest 포맷을 조정하거나, Parquet으로 내보낸 후 스크립트로 변환하세요.
->
-> ```bash
-> # CTAS 출력 파일을 단일 manifest로 합치기
-> aws s3 cp s3://my-ops-a/pitr-manifests/2024-07-15T14/ /tmp/pitr-parts/ --recursive --profile account-a
-> cat /tmp/pitr-parts/*.csv > /tmp/pitr-manifest.csv
-> aws s3 cp /tmp/pitr-manifest.csv s3://my-ops-a/pitr-manifests/2024-07-15T14/manifest.csv --profile account-a
-> ```
+> **참고**: S3 Metadata 테이블은 `s3tablescatalog`에 있으며, 이 카탈로그는 Iceberg 포맷(AVRO, ORC, PARQUET)만 지원합니다 — `TEXTFILE` 포맷의 CTAS는 지원되지 않습니다. 대신 일반 `SELECT`를 실행하고 결과 CSV를 후처리합니다.
 
 ```sql
-CREATE TABLE s3_inventory_db.pitr_manifest_20240715
-WITH (
-  external_location = 's3://my-ops-a/pitr-manifests/2024-07-15T14/',
-  format = 'TEXTFILE',
-  field_delimiter = ','
-) AS
+-- Athena에서 실행: Catalog: s3tablescatalog/aws-s3, Database: b_my-source-bucket
 WITH inventory_time_cte AS (
     SELECT COALESCE(inventory_time_from_property, inventory_time_default)
            AS inventory_time
@@ -1062,6 +1047,20 @@ WHERE is_latest_version = TRUE
   AND COALESCE(is_delete_marker, FALSE) = FALSE;
 ```
 
+쿼리 완료 후, Athena 쿼리 결과 위치에서 결과 CSV를 다운로드하고 헤더 행을 제거한 뒤 manifest로 업로드합니다:
+
+```bash
+# 결과 S3 경로 복사: Athena 콘솔 > Recent queries > 쿼리 선택 > Output location
+# 경로는 워크그룹 설정에 따라 다릅니다 (예: Unsaved/2024/07/15/<query-id>.csv 또는 query-results/<query-id>.csv)
+QUERY_RESULT="s3://${OPS_BUCKET_A}/Unsaved/2024/07/15/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.csv"  # ← 실제 Output location으로 변경
+
+aws s3 cp "${QUERY_RESULT}" /tmp/pitr-result.csv --profile account-a
+tail -n +2 /tmp/pitr-result.csv > /tmp/pitr-manifest.csv    # 헤더 행 제거
+aws s3 cp /tmp/pitr-manifest.csv s3://${OPS_BUCKET_A}/pitr-manifests/2024-07-15T14/manifest.csv --profile account-a
+```
+
+> **S3 키의 콤마**: Athena의 CSV 출력은 필드 값을 따옴표로 감싸므로, S3 키 내 콤마는 정상 처리됩니다. 다만 키에 콤마와 큰따옴표가 모두 포함된 경우, 진행 전에 manifest 파일을 확인하세요.
+
 ### 6.2 Batch Operations 복원 Job 생성
 
 먼저 복원용 버킷을 생성한 후, Batch Operations job으로 특정 버전을 복사합니다:
@@ -1069,7 +1068,7 @@ WHERE is_latest_version = TRUE
 ```bash
 # 복원 버킷 생성 (us-east-1의 경우 --create-bucket-configuration 생략)
 aws s3api create-bucket \
-  --bucket my-restore-bucket \
+  --bucket ${RESTORE_BUCKET_A} \
   --region ${REGION} \
   --create-bucket-configuration LocationConstraint=${REGION} \
   --profile account-a
@@ -1111,7 +1110,7 @@ cat > /tmp/batch-perms.json << EOF
         "s3:PutObject",
         "s3:PutObjectTagging"
       ],
-      "Resource": "arn:aws:s3:::my-restore-bucket/*"
+      "Resource": "arn:aws:s3:::${RESTORE_BUCKET_A}/*"
     },
     {
       "Effect": "Allow",
@@ -1120,6 +1119,11 @@ cat > /tmp/batch-perms.json << EOF
         "s3:GetObjectVersion"
       ],
       "Resource": "arn:aws:s3:::${OPS_BUCKET_A}/pitr-manifests/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::${OPS_BUCKET_A}/batch-reports/*"
     }
   ]
 }
@@ -1140,14 +1144,14 @@ MANIFEST_ETAG=$(aws s3api head-object \
   --bucket ${OPS_BUCKET_A} \
   --key pitr-manifests/2024-07-15T14/manifest.csv \
   --query ETag --output text \
-  --profile account-a)
+  --profile account-a | tr -d '"')
 
 # Batch Operations job 생성
 aws s3control create-job \
   --account-id ${ACCOUNT_A} \
   --operation '{
     "S3PutObjectCopy": {
-      "TargetResource": "arn:aws:s3:::my-restore-bucket",
+      "TargetResource": "arn:aws:s3:::'${RESTORE_BUCKET_A}'",
       "StorageClass": "STANDARD"
     }
   }' \
@@ -1218,7 +1222,7 @@ Account A가 탈취된 경우, Account B의 메타데이터를 사용하여 동�
 ```bash
 # Account B에 복원 버킷 생성 (us-east-1의 경우 --create-bucket-configuration 생략)
 aws s3api create-bucket \
-  --bucket my-restore-bucket-b \
+  --bucket ${RESTORE_BUCKET_B} \
   --region ${REGION} \
   --create-bucket-configuration LocationConstraint=${REGION} \
   --profile account-b
@@ -1241,12 +1245,17 @@ cat > /tmp/batch-perms-b.json << EOF
     {
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:PutObjectTagging"],
-      "Resource": "arn:aws:s3:::my-restore-bucket-b/*"
+      "Resource": "arn:aws:s3:::${RESTORE_BUCKET_B}/*"
     },
     {
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:GetObjectVersion"],
       "Resource": "arn:aws:s3:::${OPS_BUCKET_B}/pitr-manifests/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::${OPS_BUCKET_B}/batch-reports/*"
     }
   ]
 }
@@ -1259,19 +1268,11 @@ aws iam put-role-policy \
   --profile account-b
 ```
 
-Account B의 journal에서 PITR manifest를 생성합니다:
+Account B의 journal에서 PITR manifest를 생성합니다 (Step 6.1과 동일한 SELECT 방식):
 
 ```sql
 -- Account B의 Athena에서 실행
 -- Catalog: s3tablescatalog/aws-s3, Database: b_my-backup-bucket
-CREATE DATABASE IF NOT EXISTS s3_inventory_db;
-
-CREATE TABLE s3_inventory_db.pitr_manifest_dr
-WITH (
-  external_location = 's3://my-ops-b/pitr-manifests/dr-2024-07-15/',
-  format = 'TEXTFILE',
-  field_delimiter = ','
-) AS
 WITH inventory_time_cte AS (
     SELECT COALESCE(inventory_time_from_property, inventory_time_default)
            AS inventory_time
@@ -1334,20 +1335,21 @@ WHERE is_latest_version = TRUE
 
 Destination이 **Glacier Deep Archive**를 사용하므로 복사 전에 먼저 오브젝트를 복원해야 합니다. 2단계 Batch Operations 프로세스가 필요합니다.
 
-먼저 CTAS 출력 파일을 합치고 ETag를 조회합니다 (Step 6.1과 동일한 프로세스):
+먼저 Athena 쿼리 결과를 다운로드하고 헤더를 제거한 뒤 manifest로 업로드합니다 (Step 6.1과 동일한 프로세스):
 
 ```bash
-# CTAS 출력 파일을 단일 manifest로 합치기
-aws s3 cp s3://my-ops-b/pitr-manifests/dr-2024-07-15/ /tmp/pitr-parts-b/ --recursive --profile account-b
-cat /tmp/pitr-parts-b/*.csv > /tmp/pitr-manifest-dr.csv
-aws s3 cp /tmp/pitr-manifest-dr.csv s3://my-ops-b/pitr-manifests/dr-2024-07-15/manifest.csv --profile account-b
+# 결과 S3 경로 복사: Athena 콘솔 > Recent queries > 쿼리 선택 > Output location
+QUERY_RESULT_B="s3://${OPS_BUCKET_B}/Unsaved/2024/07/15/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.csv"  # ← 실제 Output location으로 변경
+aws s3 cp "${QUERY_RESULT_B}" /tmp/pitr-result-dr.csv --profile account-b
+tail -n +2 /tmp/pitr-result-dr.csv > /tmp/pitr-manifest-dr.csv
+aws s3 cp /tmp/pitr-manifest-dr.csv s3://${OPS_BUCKET_B}/pitr-manifests/dr-2024-07-15/manifest.csv --profile account-b
 
 # Manifest ETag 조회
 MANIFEST_ETAG=$(aws s3api head-object \
   --bucket ${OPS_BUCKET_B} \
   --key pitr-manifests/dr-2024-07-15/manifest.csv \
   --query ETag --output text \
-  --profile account-b)
+  --profile account-b | tr -d '"')
 ```
 
 **Step 1: 아카이브 복원 시작 (Bulk = 48시간, Standard = 12시간)**
@@ -1400,6 +1402,65 @@ aws s3control update-job-status \
 
 > **검색 티어 선택**: 전체 규모 DR에는 `BULK`(48시간)을 사용하세요 — 가장 저렴하며 Glacier IR보다도 비용이 낮습니다. 빠른 접근이 필요한 소규모 개별 복원에는 `STANDARD`(12시간)를 사용할 수 있으며, 요청당 비용이 더 높습니다.
 
+> **중요 — 2단계 복원 프로세스**: `S3InitiateRestoreObject` Batch Operations 작업은 모든 복원 **요청 제출**이 완료되면 Complete로 표시됩니다 — 이것은 오브젝트에 접근할 수 있다는 의미가 **아닙니다**. 실제 Glacier Deep Archive 복원은 작업 완료 후 **12시간(Standard)** 또는 **48시간(Bulk)**이 소요됩니다. 복원이 완료될 때까지 기다린 후 Step 2를 진행해야 합니다.
+
+**Glacier 복원 진행 상태 모니터링:**
+
+S3는 각 오브젝트의 복원이 완료될 때마다 EventBridge를 통해 `s3:ObjectRestore:Completed` 이벤트를 전송합니다. EventBridge 규칙을 설정하여 완료 수를 카운트하고 모든 오브젝트가 준비되면 알림을 받을 수 있습니다.
+
+**옵션 A: EventBridge + CloudWatch 카운터 (전체 오브젝트 확인에 권장)**
+
+`ObjectRestore:Completed` 이벤트를 CloudWatch 메트릭으로 카운트하는 EventBridge 규칙을 생성합니다. 메트릭 카운트가 manifest의 총 오브젝트 수와 일치하면 모든 복원이 완료된 것입니다.
+
+```bash
+# 1. 백업 버킷에 EventBridge 알림 활성화
+aws s3api put-bucket-notification-configuration \
+  --bucket ${DEST_BUCKET} \
+  --notification-configuration '{"EventBridgeConfiguration": {}}' \
+  --profile account-b
+
+# 2. 복원 완료를 카운트하는 EventBridge 규칙 생성
+aws events put-rule \
+  --name "s3-restore-completed" \
+  --event-pattern '{
+    "source": ["aws.s3"],
+    "detail-type": ["Object Restore Completed"],
+    "detail": {"bucket": {"name": ["'${DEST_BUCKET}'"]}}
+  }' \
+  --region ${REGION} \
+  --profile account-b
+
+# 3. (선택) SNS 타겟을 추가하여 오브젝트별 이메일 알림 수신
+# aws events put-targets --rule "s3-restore-completed" --targets '[{"Id":"sns","Arn":"arn:aws:sns:'${REGION}':'${ACCOUNT_B}':restore-notify"}]'
+```
+
+**CloudWatch** → **Metrics** → **Events** → **TriggeredRules**에서 `s3-restore-completed` 규칙의 카운트를 모니터링하고, manifest의 총 라인 수와 비교합니다:
+
+```bash
+# 복원 대상 총 오브젝트 수
+wc -l < /tmp/pitr-manifest-dr.csv
+```
+
+**옵션 B: manifest의 여러 지점에서 샘플 확인 (간편 방법)**
+
+EventBridge 설정 없이 빠르게 확인하려면, manifest의 처음, 중간, 마지막 오브젝트를 확인합니다:
+
+```bash
+TOTAL=$(wc -l < /tmp/pitr-manifest-dr.csv)
+for LINE in 1 $((TOTAL/2)) $TOTAL; do
+  KEY=$(sed -n "${LINE}p" /tmp/pitr-manifest-dr.csv | cut -d',' -f2 | tr -d '"')
+  VER=$(sed -n "${LINE}p" /tmp/pitr-manifest-dr.csv | cut -d',' -f3 | tr -d '"')
+  STATUS=$(aws s3api head-object --bucket ${DEST_BUCKET} --key "${KEY}" \
+    --version-id "${VER}" --query 'Restore' --output text --profile account-b 2>/dev/null)
+  echo "Line ${LINE}/${TOTAL}: ${STATUS}"
+done
+```
+
+- `ongoing-request="true"` → 복원 진행 중, **대기 후 재확인**
+- `ongoing-request="false", expiry-date="..."` → 복원 완료
+
+모든 샘플이 `ongoing-request="false"`를 표시하면 Step 2를 진행합니다. 대규모 복원(수백만 오브젝트)의 경우, 옵션 A가 확실한 확인 방법입니다.
+
 **Step 2: 복원된 오브젝트를 새 버킷에 복사 (복원 완료 후)**
 
 ```bash
@@ -1407,7 +1468,7 @@ aws s3control create-job \
   --account-id ${ACCOUNT_B} \
   --operation '{
     "S3PutObjectCopy": {
-      "TargetResource": "arn:aws:s3:::my-restore-bucket-b",
+      "TargetResource": "arn:aws:s3:::'${RESTORE_BUCKET_B}'",
       "StorageClass": "STANDARD"
     }
   }' \
@@ -1446,6 +1507,8 @@ aws s3control update-job-status \
   --region ${REGION} \
   --profile account-b
 ```
+
+> **DR 완료 확인**: **S3 콘솔** → **Batch Operations** → 복사 작업을 선택합니다. 상태가 **Complete**이고 **Successful** 수가 **Total** 수와 일치하면 DR 복구가 완료된 것입니다. `${RESTORE_BUCKET_B}` 버킷에서 복원된 오브젝트를 확인하세요.
 
 ---
 
