@@ -6,11 +6,13 @@
 
 ## Introduction
 
-Imagine you manage an Amazon S3 environment with **500 TB of data across 500 million objects**. You need to protect it against three threats: **ransomware**, **account takeover**, and **accidental changes** — and you need the ability to restore to any point in time.
+Customers trust Amazon S3 with their most valuable data — driven by its 11 nines of durability and proven operational reliability. Naturally, they want to protect that data from ransomware, accidental deletion, and operator errors through backup. However, many hesitate to act when faced with the sheer volume of data and the associated backup costs.
 
-AWS Backup for S3 is the most comprehensive solution, offering centralized management, continuous backup, and seamless point-in-time recovery. However, at this scale, the cost can be substantial — per-object charges alone may reach significant amounts with 500 million objects.
+The consequences of inaction can be severe. Some organizations managing hundreds of terabytes find that per-job backup pricing makes adoption impractical, leaving critical data exposed with no structured recovery strategy. Others discover the gap only after an incident — when operator mistakes or malicious actions cause irreversible data loss, and there is simply nothing to restore from.
 
-For organizations where AWS Backup costs are prohibitive, is there an alternative? In this post, we present a **minimum-cost data protection architecture** using native AWS services — S3 Versioning, Cross-Account Replication, Object Lock, S3 Metadata, Athena, and S3 Batch Operations. While this approach offers fewer features and requires more operational effort than AWS Backup, it provides essential data protection at a fraction of the cost — roughly **$600/month** for the same 500 TB environment.
+AWS Backup for S3 is the most comprehensive solution, offering centralized management, continuous backup, and seamless point-in-time recovery. However, at scale — say, **500 TB across 500 million objects** — the cost can be substantial, and per-object charges alone may reach significant amounts.
+
+For customers who gave up on backup due to cost, this architecture offers a practical path forward. By combining native S3 capabilities — **Versioning**, **Cross-Account Replication**, **Object Lock**, **Lifecycle to Glacier Deep Archive**, **S3 Metadata**, and **S3 Batch Operations** — you can protect your data at an estimated **60–80% lower cost** compared to AWS Backup, making backup feasible even for the largest and most cost-sensitive workloads. While this approach requires more operational effort than AWS Backup, it provides essential data protection at roughly **$600/month** for a 500 TB environment.
 
 ## Cost Comparison at a Glance
 
@@ -191,6 +193,8 @@ This configuration:
 - Keeps noncurrent versions accessible for **7 days**, then transitions to Glacier IR
 - Retains the **3 most recent** noncurrent versions per object
 - Deletes noncurrent versions older than **90 days**
+
+> **Note:** Only noncurrent versions are transitioned to Glacier IR — these are created only when objects are overwritten or deleted. Current (latest) versions remain in their original storage class. The actual Glacier IR storage volume depends on your data change rate, not the total bucket size.
 
 ---
 
@@ -1437,9 +1441,25 @@ aws events put-rule \
 Monitor the restore count in **CloudWatch** → **Metrics** → **Events** → **TriggeredRules** for the `s3-restore-completed` rule, and compare it with the total manifest line count:
 
 ```bash
+# Restore-completed count (TriggeredRules metric for the last 1 hour)
+# macOS: replace -d '1 hour ago' with -v-1H
+aws cloudwatch get-metric-statistics \
+  --namespace "AWS/Events" \
+  --metric-name "TriggeredRules" \
+  --dimensions Name=RuleName,Value=s3-restore-completed \
+  --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 3600 \
+  --statistics Sum \
+  --region ${REGION} \
+  --profile account-b \
+  --query 'Datapoints[0].Sum' --output text
+
 # Total objects to restore
 wc -l < /tmp/pitr-manifest-dr.csv
 ```
+
+> **Note:** The EventBridge rule must be created **before** the restore completes. If the rule is created after restores have already finished, the `TriggeredRules` metric will return `None` because past events are not captured retroactively. In that case, use Option B below to verify restore status.
 
 **Option B: Spot-check multiple samples from the manifest**
 
@@ -1464,6 +1484,13 @@ When all samples show `ongoing-request="false"`, proceed to Step 2. For large re
 **Step 2: Copy restored objects to a new bucket (after restore completes)**
 
 ```bash
+# Re-fetch the manifest ETag (in case the shell session has changed since Step 1)
+MANIFEST_ETAG=$(aws s3api head-object \
+  --bucket ${OPS_BUCKET_B} \
+  --key pitr-manifests/dr-2024-07-15/manifest.csv \
+  --query ETag --output text \
+  --profile account-b | tr -d '"')
+
 aws s3control create-job \
   --account-id ${ACCOUNT_B} \
   --operation '{
@@ -1509,6 +1536,26 @@ aws s3control update-job-status \
 ```
 
 > **Verify DR completion**: Open the **S3 console** → **Batch Operations** → select the copy job. When the status shows **Complete** and the **Successful** count matches the **Total** count, the DR recovery is finished. Verify the restored objects in the `${RESTORE_BUCKET_B}` bucket.
+
+You can also verify from the CLI:
+
+```bash
+# Check copy job status (replace <COPY_JOB_ID> with the job ID returned above)
+aws s3control describe-job \
+  --account-id ${ACCOUNT_B} \
+  --job-id <COPY_JOB_ID> \
+  --region ${REGION} \
+  --profile account-b \
+  --query 'Job.{Status:Status,Total:ProgressSummary.TotalNumberOfTasks,Succeeded:ProgressSummary.NumberOfTasksSucceeded,Failed:ProgressSummary.NumberOfTasksFailed}'
+
+# (Optional) Verify objects in the restore bucket
+# For large-scale buckets (hundreds of millions of objects), this command may
+# incur significant LIST request costs and take a long time to complete.
+# In that case, rely on the describe-job output above instead.
+# aws s3 ls s3://${RESTORE_BUCKET_B}/ --recursive --summarize --profile account-b
+```
+
+When `Status` is `Complete` and `Succeeded` matches `Total`, the DR recovery is finished.
 
 ---
 

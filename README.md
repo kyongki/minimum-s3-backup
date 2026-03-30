@@ -1,42 +1,44 @@
-# 최소 비용, 최대 보호: AWS 네이티브 서비스로 S3 랜섬웨어 방어와 시점 복구 구축하기
+# Minimal Cost, Maximum Protection: Building S3 Ransomware Defense and Point-in-Time Recovery with Native AWS Services
 
-*AWS 네이티브 서비스만으로 비용 효율적인 S3 데이터 보호 전략을 구축하는 실습 가이드*
+*A practical guide to building a cost-effective S3 data protection strategy using native AWS services*
 
 ---
 
-## 소개
+## Introduction
 
-Amazon S3 환경에 **500TB의 데이터와 5억 개의 오브젝트**를 관리하고 있다고 가정해봅시다. **랜섬웨어**, **계정 탈취**, **실수로 인한 변경** 세 가지 위협으로부터 데이터를 보호해야 하며, 특정 시점으로의 복구(PITR) 기능도 필요합니다.
+Customers trust Amazon S3 with their most valuable data — driven by its 11 nines of durability and proven operational reliability. Naturally, they want to protect that data from ransomware, accidental deletion, and operator errors through backup. However, many hesitate to act when faced with the sheer volume of data and the associated backup costs.
 
-AWS Backup for S3는 중앙 집중식 관리, 연속 백업, 원활한 시점 복구를 제공하는 가장 포괄적인 솔루션입니다. 하지만 이 규모에서는 비용이 상당할 수 있습니다 — 5억 개 오브젝트의 오브젝트별 과금만으로도 큰 금액에 달합니다.
+The consequences of inaction can be severe. Some organizations managing hundreds of terabytes find that per-job backup pricing makes adoption impractical, leaving critical data exposed with no structured recovery strategy. Others discover the gap only after an incident — when operator mistakes or malicious actions cause irreversible data loss, and there is simply nothing to restore from.
 
-AWS Backup 비용이 부담되는 조직을 위한 대안은 없을까요? 이 글에서는 S3 Versioning, Cross-Account Replication, Object Lock, S3 Metadata, Athena, S3 Batch Operations 등 **AWS 네이티브 서비스를 활용한 최소 비용 데이터 보호 아키텍처**를 소개합니다. AWS Backup에 비해 기능이 제한적이고 운영 부담이 더 크지만, 동일한 500TB 환경에서 약 **월 $600**으로 필수적인 데이터 보호를 제공합니다.
+AWS Backup for S3 is the most comprehensive solution, offering centralized management, continuous backup, and seamless point-in-time recovery. However, at scale — say, **500 TB across 500 million objects** — the cost can be substantial, and per-object charges alone may reach significant amounts.
 
-## 비용 비교 요약
+For customers who gave up on backup due to cost, this architecture offers a practical path forward. By combining native S3 capabilities — **Versioning**, **Cross-Account Replication**, **Object Lock**, **Lifecycle to Glacier Deep Archive**, **S3 Metadata**, and **S3 Batch Operations** — you can protect your data at an estimated **60–80% lower cost** compared to AWS Backup, making backup feasible even for the largest and most cost-sensitive workloads. While this approach requires more operational effort than AWS Backup, it provides essential data protection at roughly **$600/month** for a 500 TB environment.
 
-| 항목 | AWS Backup | 본 아키텍처 |
-|------|-----------|------------|
-| 백업 스토리지 (500TB) | ~$11,500/월 (periodic backup) | ~$500/월 (Deep Archive) |
-| 오브젝트별 과금 (백업/복원) | 백업 유형에 따라 상이 — [AWS Backup 요금](https://aws.amazon.com/backup/pricing/) 참조 | **$0** |
-| Object Lock / Versioning | — | **$0** (무료 기능) |
-| S3 Metadata (PITR) | — | ~$50/월 |
-| 데이터 전송 (동일 리전) | — | **$0** |
-| **월 추가 비용 합계** | **~$12,000+** (스토리지만) | **~$600** |
+## Cost Comparison at a Glance
 
-> **AWS Backup 요금 참고**: AWS Backup for S3는 정기 백업과 연속 백업의 과금 방식이 다르며, 복원 시 오브젝트별 추가 요금이 발생합니다. 5억 개 오브젝트 규모에서는 이 비용이 상당할 수 있습니다. 구체적인 백업 구성에 따라 [최신 요금 페이지](https://aws.amazon.com/backup/pricing/)를 반드시 확인하세요.
+| Component | AWS Backup | This Architecture |
+|-----------|-----------|-------------------|
+| Backup storage (500 TB) | ~$11,500/mo (periodic backup) | ~$500/mo (Deep Archive) |
+| Per-object charges (backup/restore) | Varies by backup type — see [AWS Backup pricing](https://aws.amazon.com/backup/pricing/) | **$0** |
+| Object Lock / Versioning | — | **$0** (free features) |
+| S3 Metadata (PITR) | — | ~$50/mo |
+| Data transfer (same-region) | — | **$0** |
+| **Monthly total (additional)** | **~$12,000+** (storage alone) | **~$600** |
 
-## 아키텍처 개요
+> **Note on AWS Backup pricing**: AWS Backup for S3 charges differently for periodic vs. continuous backup, and restore operations incur additional per-object fees. At 500 million objects, these per-object costs can be substantial. Always consult the [latest pricing page](https://aws.amazon.com/backup/pricing/) for your specific backup configuration.
 
-아키텍처는 **보호 계층**(공격 방어 및 생존)과 **복구 계층**(시점 검색 및 복원) 두 가지로 구성됩니다.
+## Architecture Overview
+
+The architecture has two layers: **protection** (prevent and survive attacks) and **recovery** (search and restore to any point in time).
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Account A (운영)                                                 │
+│  Account A (Production)                                          │
 │  ┌────────────────────────────────┐                              │
 │  │  Source Bucket                  │                              │
 │  │  - Versioning: Enabled         │── Same-Region ──┐            │
 │  │  - IAM Deny Policies           │   Replication    │            │
-│  │  - Lifecycle: noncurrent 관리   │                  │            │
+│  │  - Lifecycle: noncurrent mgmt  │                  │            │
 │  │  - S3 Metadata: Journal +      │                  │            │
 │  │    Live Inventory (Iceberg)    │                  │            │
 │  └────────────────────────────────┘                  │            │
@@ -48,12 +50,12 @@ AWS Backup 비용이 부담되는 조직을 위한 대안은 없을까요? 이 �
 └──────────────────────────────────────────────────────│────────────┘
                                                        │
 ┌──────────────────────────────────────────────────────│────────────┐
-│  Account B (백업 — 격리)                              │            │
+│  Account B (Backup — Isolated)                       │            │
 │  ┌────────────────────────────────┐                  │            │
 │  │  Destination Bucket            │◄─────────────────┘            │
-│  │  - Object Lock: Compliance 180일│                              │
+│  │  - Object Lock: Compliance 180d│                               │
 │  │  - Storage: Deep Archive       │                               │
-│  │  - Bucket Policy: 삭제 거부     │                               │
+│  │  - Bucket Policy: Deny Delete  │                               │
 │  │  - S3 Metadata: Journal +      │                               │
 │  │    Live Inventory (Iceberg)    │                               │
 │  └────────────────────────────────┘                               │
@@ -61,62 +63,62 @@ AWS Backup 비용이 부담되는 조직을 위한 대안은 없을까요? 이 �
 │  │  Ops Bucket (B)                │                               │
 │  │  - PITR manifests & reports    │                               │
 │  └────────────────────────────────┘                               │
-│  Object Lock Compliance: 180일간 변경 불가                          │
+│  Object Lock Compliance: immutable for 180 days                  │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-### 위협별 복구 매트릭스
+### Threat-to-Recovery Matrix
 
-| 위협 | 보호 계층 | 복구 경로 | RTO |
-|------|----------|----------|-----|
-| 실수로 덮어쓰기 | Source versioning | Source에서 이전 버전 복원 | 즉시 |
-| 실수로 삭제 | Source versioning (delete marker) | Delete marker 제거 | 즉시 |
-| 랜섬웨어 (대량 덮어쓰기) | Source versioning + IAM deny | Batch Ops로 Source 버전 PITR 복구 | 수 시간 |
-| Account A 탈취 | Account B 격리 + Compliance Lock | Batch Ops로 Account B에서 PITR 복구 (복원 + 복사) | 12–48시간 |
+| Threat | Protection Layer | Recovery Path | RTO |
+|--------|-----------------|---------------|-----|
+| Accidental overwrite | Source versioning | Restore previous version from source | Immediate |
+| Accidental delete | Source versioning (delete marker) | Remove delete marker | Immediate |
+| Ransomware (mass overwrite) | Source versioning + IAM deny | PITR from source versions via Batch Ops | Hours |
+| Account A takeover | Account B isolation + Compliance Lock | PITR from Account B via Batch Ops (restore + copy) | 12–48 hours |
 
-### Source 버킷에 Object Lock만 걸면 안 되나?
+### Why Not Just Object Lock on the Source Bucket?
 
-자연스러운 질문이 생깁니다: **Object Lock(Compliance 모드)이 root도 삭제 못하게 막는다면, Source 버킷에만 걸고 Cross-Account 백업은 생략해도 되지 않을까?**
+A natural question arises: **if Object Lock (Compliance mode) prevents even root from deleting objects, why not just enable it on the source bucket and skip cross-account backup entirely?**
 
-Source 버킷의 Object Lock은 분명 의미 있는 보호를 제공합니다 — Compliance 모드는 IAM 권한과 무관하게 보존 기간 동안 잠긴 오브젝트 버전의 삭제를 차단합니다. 하지만 **AWS 계정 자체가 탈취**되면 치명적인 한계가 드러납니다:
+Object Lock on the source bucket does provide meaningful protection — Compliance mode ensures locked object versions cannot be deleted during the retention period, regardless of IAM permissions. However, it has critical gaps when the **AWS account itself** is compromised:
 
-| 위협 시나리오 | Source Object Lock만 | Cross-Account 백업 |
-|--------------|---------------------|-------------------|
-| IAM 탈취 → 기존 오브젝트 삭제 시도 | **방어됨** (Compliance 모드가 삭제 차단) | **방어됨** |
-| IAM 탈취 → 악성 오브젝트 업로드 | 차단 불가 (새 오브젝트는 수용됨) | 백업에서 PITR로 정상 상태 복구 |
-| **AWS 계정 탈취 (root 자격증명)** | **위험**: 계정 폐쇄 시 접근 차단 (90일 유예 기간 후 리소스 삭제) | **방어됨** (별도 계정) |
-| root 탈취 → Bucket Policy로 전체 접근 차단 | **위험**: 데이터 접근 불가 | **방어됨** |
-| root 탈취 → CloudTrail 비활성화, 로그 조작 | **위험**: 포렌식 증거 소실 | 백업 계정에 독립적 감사 기록 유지 |
-| 내부자 위협 (관리자 공모) | 단일 계정 = 단일 신뢰 경계 | 신뢰 경계가 **격리**됨 |
+| Threat Scenario | Source Object Lock Only | Cross-Account Backup |
+|-----------------|------------------------|---------------------|
+| IAM compromise → delete existing objects | **Protected** (Compliance mode blocks deletion) | **Protected** |
+| IAM compromise → upload malicious objects | Not blocked (new objects are accepted) | PITR from backup restores clean state |
+| **AWS account takeover (root credentials)** | **Risk**: account closure suspends access (resources deleted after 90-day grace period) | **Protected** (separate account) |
+| Root compromise → Bucket Policy deny all access | **Risk**: data becomes inaccessible | **Protected** |
+| Root compromise → disable CloudTrail, tamper logs | **Risk**: forensic evidence lost | Backup account retains independent audit trail |
+| Insider threat (admin collusion) | Single account = single trust boundary | **Isolated** across trust boundaries |
 
-**핵심 한계**: Object Lock은 *버킷 내 오브젝트*를 보호하지만, **계정 수준 작업**으로부터는 보호할 수 없습니다 — 계정 폐쇄, 결제 설정 변경으로 인한 정지, deny-all Bucket Policy 적용 등. 공격자가 계정의 root 접근 권한을 획득하면, 데이터는 기술적으로 온전하더라도 운영적으로 접근 불가능해질 수 있습니다.
+**The key gap**: Object Lock protects *objects within a bucket*, but it cannot protect against **account-level actions** — closing the account, modifying billing settings to trigger suspension, or applying deny-all bucket policies. If an attacker gains root access to the account, the data may be technically intact but operationally unreachable.
 
-Cross-Account 백업은 **별도의 신뢰 경계**를 만들어 이 문제를 해결합니다:
+Cross-account backup addresses this by creating a **separate trust boundary**:
 
-- **계정 격리**: Account A가 침해되어도 Account B의 IAM, SCP, 리소스에 대한 접근 권한은 전혀 없음
-- **Object Lock 불변성**: Account B의 Compliance 모드가 예외 없이 모든 삭제를 차단 — root도 잠긴 객체의 삭제나 보존 기간 단축 불가. 한번 활성화된 Object Lock은 버킷에서 제거할 수 없음
-- **독립적 메타데이터**: Account B가 자체 S3 Metadata journal을 유지하여, Account A의 메타데이터가 파괴되어도 PITR 가능
-- **컴플라이언스 충족**: 금융, 의료 등 많은 규제 프레임워크가 별도 계정 또는 환경에 백업 복사본을 명시적으로 요구
+- **Account isolation**: Compromising Account A gives zero access to Account B's IAM, SCPs, or resources
+- **Object Lock immutability**: Compliance mode on Account B blocks all deletes with no exceptions — even root cannot delete or shorten retention on locked objects. Once enabled, Object Lock cannot be removed from the bucket
+- **Independent metadata**: Account B maintains its own S3 Metadata journal, enabling PITR even if Account A's metadata is destroyed
+- **Compliance alignment**: Many regulatory frameworks (financial services, healthcare) explicitly require backup copies in a separate account or environment
 
-**권장 사항**: Source 버킷의 Object Lock은 일상적인 위협(실수 삭제, IAM 수준 공격)에 대한 **1차 방어선**으로 활용하세요. Cross-Account 백업은 계정 수준 침해 — 다른 모든 방어가 실패한 최악의 시나리오 — 에 대한 **최후의 방어선**으로 활용하세요.
+**Recommendation**: Use Object Lock on the source bucket as a **first line of defense** against everyday threats (accidental deletes, IAM-level attacks). Use cross-account backup as the **last line of defense** against account-level compromise — the scenario where everything else has failed.
 
-> **본 워크스루에서 Source 버킷에 Object Lock을 설정하지 않는 이유**: 운영 버킷에 Object Lock을 적용하면 보존 기간 동안 잠긴 오브젝트 버전을 삭제할 수 없어 운영상 제약이 생깁니다 — 스토리지 정리, 컴플라이언스 기반 데이터 삭제 등 데이터 생명주기 관리가 복잡해집니다. (참고: Object Lock은 덮어쓰기를 차단하지 않습니다 — 같은 키에 `PutObject`하면 새 버전이 생성되고, 잠긴 기존 버전은 noncurrent로 보존됩니다.) 본 워크스루에서는 Source 버킷에 **IAM deny 정책 + Versioning** 조합을 사용하여, 유사한 보호 효과(비인가 삭제 차단, 모든 버전 보존)를 더 높은 운영 유연성과 함께 제공합니다. 워크로드가 삭제에 대한 보존 제약을 수용할 수 있다면, Source 버킷에도 Object Lock을 추가하는 것을 권장합니다.
+> **Why this walkthrough does not enable Object Lock on the source bucket**: Object Lock on a production bucket adds operational constraints — locked object versions cannot be deleted during the retention period, which complicates data lifecycle management such as storage cleanup and compliance-driven data removal. (Note: Object Lock does not block overwrites — a `PutObject` to the same key creates a new version while the locked old version is preserved as noncurrent.) This walkthrough uses **IAM deny policies + Versioning** on the source bucket instead, which provides similar protection (block unauthorized deletes, preserve all versions) with greater operational flexibility. If your workload can tolerate retention constraints on deletion, enabling Object Lock on the source bucket is a worthwhile addition.
 
-## 사전 준비
+## Prerequisites
 
-실습을 시작하기 전에 다음을 준비하세요:
+Before starting the walkthrough, ensure you have:
 
-- **두 개의 AWS 계정** (Account A: 운영, Account B: 백업) — 동일 AWS Organization에 속하지 않아도 됨
-- **두 계정 모두 동일 리전** (예: `us-east-1`) — 데이터 전송 비용 방지
-- **AWS CLI v2.27.51 이상**: 두 계정의 자격 증명으로 구성 (S3 Metadata V2 API에 필요)
-- **권한**: 두 계정의 IAM 관리자 권한
+- **Two AWS accounts** (Account A: production, Account B: backup) — they do not need to be in the same AWS Organization
+- **Both accounts in the same Region** (e.g., `us-east-1`) to avoid data transfer costs
+- **AWS CLI v2.27.51 or later** configured with appropriate credentials for both accounts (S3 Metadata V2 API requires this version)
+- **Permissions**: IAM admin access for both accounts
 
 ```bash
-# 두 계정의 CLI 프로파일 설정
+# Set up CLI profiles for both accounts
 aws configure --profile account-a
 aws configure --profile account-b
 
-# 본 실습에서 사용하는 변수
+# Variables used throughout this walkthrough
 export ACCOUNT_A=111111111111
 export ACCOUNT_B=222222222222
 export REGION=us-east-1
@@ -130,11 +132,11 @@ export RESTORE_BUCKET_B=my-restore-bucket-b
 
 ---
 
-## Step 1: Source 버킷 구성 (Account A)
+## Step 1: Configure the Source Bucket (Account A)
 
-### 1.1 Versioning 활성화
+### 1.1 Enable Versioning
 
-Versioning은 전체 아키텍처의 기반입니다. 덮어쓰기나 삭제 시 이전 버전이 보존되어 복구가 가능해집니다.
+Versioning is the foundation of the entire architecture. Every overwrite or delete preserves the previous version, making recovery possible.
 
 ```bash
 aws s3api put-bucket-versioning \
@@ -143,20 +145,20 @@ aws s3api put-bucket-versioning \
   --profile account-a
 ```
 
-확인:
+Verify:
 
 ```bash
 aws s3api get-bucket-versioning \
   --bucket ${SOURCE_BUCKET} \
   --profile account-a
 
-# 예상 출력:
+# Expected output:
 # { "Status": "Enabled" }
 ```
 
-### 1.2 Noncurrent 버전 Lifecycle 설정
+### 1.2 Configure Lifecycle for Noncurrent Versions
 
-Lifecycle 규칙 없이는 이전 버전이 무한히 누적됩니다. 이 정책으로 복구 기간을 유지하면서 비용을 제어합니다:
+Without lifecycle rules, old versions accumulate indefinitely. This policy keeps costs under control while maintaining a recovery window:
 
 ```bash
 cat > /tmp/lifecycle.json << 'EOF'
@@ -187,23 +189,25 @@ aws s3api put-bucket-lifecycle-configuration \
   --profile account-a
 ```
 
-이 설정의 동작:
-- Noncurrent 버전을 **7일간** 즉시 접근 가능하게 유지한 후 Glacier IR로 전환
-- 오브젝트당 **최근 3개** noncurrent 버전 유지
-- **90일** 이후 noncurrent 버전 삭제
+This configuration:
+- Keeps noncurrent versions accessible for **7 days**, then transitions to Glacier IR
+- Retains the **3 most recent** noncurrent versions per object
+- Deletes noncurrent versions older than **90 days**
+
+> **Note:** Only noncurrent versions are transitioned to Glacier IR — these are created only when objects are overwritten or deleted. Current (latest) versions remain in their original storage class. The actual Glacier IR storage volume depends on your data change rate, not the total bucket size.
 
 ---
 
-## Step 2: Destination 버킷 구성 (Account B)
+## Step 2: Configure the Destination Bucket (Account B)
 
-### 2.1 Object Lock이 활성화된 버킷 생성
+### 2.1 Create the Bucket with Object Lock
 
-Object Lock은 전통적으로 버킷 생성 시에만 활성화할 수 있었습니다. 하지만 현재 AWS는 기존 버킷에서도 Object Lock 활성화를 지원합니다 — S3 콘솔, CLI, 또는 `put-object-lock-configuration` API로 가능합니다. Object Lock은 Versioning을 필요로 합니다 (먼저 활성화하거나 활성화 과정에서 함께 켜짐). 기본 보존 설정은 새 오브젝트 버전에만 적용되며, 기존 버전에는 소급 적용되지 않습니다.
+Object Lock has traditionally required enabling at bucket creation time. However, AWS now supports enabling Object Lock on existing buckets — you can do this via the S3 console, CLI, or API using `put-object-lock-configuration`. Note that Object Lock requires versioning (which must be enabled first or will be enabled as part of the process), and default retention settings apply only to new object versions; existing versions are not retroactively locked.
 
-본 실습에서는 새 버킷을 생성합니다:
+For this walkthrough, we create a new bucket:
 
 ```bash
-# us-east-1의 경우 --create-bucket-configuration 생략
+# For us-east-1, omit --create-bucket-configuration
 aws s3api create-bucket \
   --bucket ${DEST_BUCKET} \
   --region ${REGION} \
@@ -212,11 +216,11 @@ aws s3api create-bucket \
   --profile account-b
 ```
 
-### 2.2 Object Lock을 Compliance 모드로 설정
+### 2.2 Set Object Lock to Compliance Mode
 
-Compliance 모드는 보존 기간 동안 **root 사용자를 포함하여 그 누구도** 오브젝트를 삭제하거나 수정할 수 없도록 보장합니다. 이것이 계정 탈취 방어의 핵심입니다.
+Compliance mode ensures that **no one — not even the root user** — can delete or modify objects during the retention period. This is the critical defense against account takeover.
 
-> **왜 180일인가?** Glacier Deep Archive는 **180일 최소 보관 과금**이 적용됩니다 — 180일 이전에 삭제해도 180일치 요금이 부과됩니다. Object Lock 보존 기간을 180일로 설정하여 이 최소 과금 기간에 맞추고, 더 긴 보호 기간을 확보합니다.
+> **Why 180 days?** Glacier Deep Archive has a **180-day minimum storage charge** — objects deleted before 180 days are still billed for the full period. Setting Object Lock retention to 180 days aligns with this minimum and provides a longer protection window.
 
 ```bash
 aws s3api put-object-lock-configuration \
@@ -233,35 +237,35 @@ aws s3api put-object-lock-configuration \
   --profile account-b
 ```
 
-### 2.3 Glacier Deep Archive를 선택한 이유
+### 2.3 Why Glacier Deep Archive?
 
-Destination 버킷은 **최후의 보루** — Account A가 완전히 탈취된 경우에만 사용합니다. 이런 시나리오에서 12–48시간 복원 대기는 충분히 수용 가능하며, 비용 절감 효과가 큽니다.
+The destination bucket is a **last-resort backup** — used only when Account A is fully compromised. In that scenario, waiting 12–48 hours for restore is acceptable, and the cost savings are substantial.
 
-| 항목 | Glacier Instant Retrieval | Deep Archive (Bulk, 48시간) | Deep Archive (Standard, 12시간) |
-|------|--------------------------|---------------------------|-------------------------------|
-| 월간 스토리지 (500TB) | $2,000 | $495 | $495 |
-| 전체 복원 요청 비용 (5억 obj) | $5,000 | $12,500 | $50,000 |
-| 전체 복원 데이터 검색 비용 (500TB) | $15,000 | $1,250 | $10,000 |
-| **전체 복구 총 비용** | **$20,000** | **$13,750** | **$60,000** |
-| 복원 시간 | 밀리초 | 48시간 | 12시간 |
+| Factor | Glacier Instant Retrieval | Deep Archive (Bulk, 48h) | Deep Archive (Standard, 12h) |
+|--------|--------------------------|-------------------------|------------------------------|
+| Monthly storage (500 TB) | $2,000 | $495 | $495 |
+| Full restore request cost (500M obj) | $5,000 | $12,500 | $50,000 |
+| Full restore retrieval cost (500 TB) | $15,000 | $1,250 | $10,000 |
+| **Total recovery cost** | **$20,000** | **$13,750** | **$60,000** |
+| Restore time | Milliseconds | 48 hours | 12 hours |
 
-**Bulk 검색**(48시간)은 전체 규모 DR에 최적입니다 — 스토리지와 복구 비용 모두 Glacier IR보다 **오히려 저렴**합니다. 더 빠른 복원이 필요한 소규모 개별 복구에는 **Standard 검색**(12시간)을 사용할 수 있으며, 요청당 비용이 더 높습니다.
+**Bulk retrieval** (48 hours) is the best option for full-scale DR — it is actually **cheaper than Glacier IR** for both storage and recovery. For smaller, targeted restores where faster turnaround matters, **Standard retrieval** (12 hours) is available at higher per-request cost.
 
-Deep Archive는 스토리지만으로 **월 $1,505 절약** (연 $18,060)됩니다. Bulk 검색과 결합하면 전체 DR 복구 비용도 Glacier IR보다 **$6,250 저렴**합니다. 유일한 trade-off는 복원 지연 시간(12–48시간)과 2단계 복구 프로세스(복원 → 복사)이며, 이는 Step 6.4에서 다룹니다.
+Deep Archive saves **$1,505/month** ($18,060/year) on storage alone. Combined with Bulk retrieval, a full DR restore costs **$6,250 less** than Glacier IR. The only trade-offs are restore latency (12–48 hours) and a two-step recovery process (restore → copy), which we cover in Step 6.4.
 
-### 2.4 Ops 버킷 생성 (Manifest 및 리포트용)
+### 2.4 Create Ops Buckets (for Manifests and Reports)
 
-이후 단계에서 참조되는 Batch Operations 완료 리포트 및 PITR manifest 저장용 버킷을 미리 생성합니다:
+These buckets store Batch Operations completion reports and PITR manifests. We create them now because they are referenced in later steps:
 
 ```bash
-# Account A ops 버킷 (us-east-1의 경우 --create-bucket-configuration 생략)
+# Account A ops bucket (for us-east-1, omit --create-bucket-configuration)
 aws s3api create-bucket \
   --bucket ${OPS_BUCKET_A} \
   --region ${REGION} \
   --create-bucket-configuration LocationConstraint=${REGION} \
   --profile account-a
 
-# Account B ops 버킷
+# Account B ops bucket
 aws s3api create-bucket \
   --bucket ${OPS_BUCKET_B} \
   --region ${REGION} \
@@ -271,14 +275,14 @@ aws s3api create-bucket \
 
 ---
 
-## Step 3: Cross-Account 동일 리전 복제 설정
+## Step 3: Set Up Cross-Account Same-Region Replication
 
-동일 리전의 계정 간 복제(SRR)는 **데이터 전송 비용이 $0**입니다 — 이 규모에서 월 ~$10,000이 추가되는 교차 리전 복제(CRR) 대비 핵심 이점입니다.
+Same-region replication (SRR) between accounts in the same region incurs **zero data transfer cost** — a key advantage over cross-region replication, which would add ~$10,000/month at this scale.
 
-### 3.1 복제용 IAM Role 생성 (Account A)
+### 3.1 Create the Replication IAM Role (Account A)
 
 ```bash
-# 신뢰 정책
+# Trust policy
 cat > /tmp/replication-trust.json << EOF
 {
   "Version": "2012-10-17",
@@ -302,7 +306,7 @@ aws iam create-role \
   --assume-role-policy-document file:///tmp/replication-trust.json \
   --profile account-a
 
-# 권한 정책
+# Permission policy
 cat > /tmp/replication-perms.json << EOF
 {
   "Version": "2012-10-17",
@@ -355,9 +359,9 @@ aws iam put-role-policy \
   --profile account-a
 ```
 
-### 3.2 Destination Bucket Policy 적용 (Account B)
+### 3.2 Apply the Destination Bucket Policy (Account B)
 
-이중 보안을 위해 — Account A의 복제를 허용하면서 모든 삭제 작업을 차단합니다:
+Belt and suspenders — even without Object Lock, this policy allows replication from Account A while blocking all delete operations:
 
 ```bash
 cat > /tmp/dest-bucket-policy.json << EOF
@@ -406,9 +410,9 @@ aws s3api put-bucket-policy \
   --profile account-b
 ```
 
-> **Step 3.1 이후에 적용하는 이유**: Bucket policy가 복제 role의 ARN을 Principal로 참조합니다. AWS는 정책 적용 시 해당 principal의 존재를 검증하므로, role을 먼저 생성해야 합니다.
+> **Why apply this after Step 3.1?** The bucket policy references the replication role's ARN as a principal. AWS validates that the principal exists when the policy is applied, so the role must be created first.
 
-### 3.3 복제 규칙 설정
+### 3.3 Configure the Replication Rule
 
 ```bash
 cat > /tmp/replication-config.json << EOF
@@ -450,11 +454,11 @@ aws s3api put-bucket-replication \
   --profile account-a
 ```
 
-> **핵심 설정: `DeleteMarkerReplication: Disabled`** — Account A에서 오브젝트를 삭제해도 delete marker가 Account B로 복제되지 않습니다. 공격자가 Source의 모든 것을 삭제하더라도 백업 복사본은 온전하게 유지됩니다.
+> **Key setting: `DeleteMarkerReplication: Disabled`** — When an object is deleted in Account A, the delete marker is NOT replicated to Account B. This means even if an attacker deletes everything in the source, the backup copies remain fully intact.
 
-### 3.4 기존 오브젝트를 S3 Batch Replication으로 복제
+### 3.4 Replicate Existing Objects with S3 Batch Replication
 
-위 복제 규칙은 새 오브젝트에만 적용됩니다. 기존 5억 개 오브젝트를 복제하려면 S3 Batch Replication을 사용합니다:
+The replication rule above only applies to new objects. To replicate the existing 500 million objects, use S3 Batch Replication:
 
 ```bash
 aws s3control create-job \
@@ -485,10 +489,10 @@ aws s3control create-job \
   --profile account-a
 ```
 
-Job이 생성되면 실행을 확인합니다:
+After the job is created, confirm it to start execution:
 
 ```bash
-# Job이 "Suspended" 상태가 될 때까지 대기 (New → Preparing → Suspended 순서로 전환)
+# Wait for the job to reach "Suspended" status (it transitions from New → Preparing → Suspended)
 aws s3control describe-job \
   --account-id ${ACCOUNT_A} \
   --job-id <JOB_ID> \
@@ -496,7 +500,7 @@ aws s3control describe-job \
   --region ${REGION} \
   --profile account-a
 
-# "Suspended" 상태 확인 후 실행 승인
+# Once status is "Suspended", confirm the job to start execution
 aws s3control update-job-status \
   --account-id ${ACCOUNT_A} \
   --job-id <JOB_ID> \
@@ -507,11 +511,11 @@ aws s3control update-job-status \
 
 ---
 
-## Step 4: IAM과 Bucket Policy로 잠금
+## Step 4: Lock Down with IAM and Bucket Policies
 
-### 4.1 IAM: 위험한 작업 거부 (Account A)
+### 4.1 IAM: Deny Dangerous Actions (Account A)
 
-관리자가 아닌 모든 Role에 인라인 deny 정책(또는 관리형 정책으로 연결)으로 적용합니다. Versioning 비활성화, 버킷 정책 변경, 복제 설정 변경 등을 차단합니다:
+Apply this as an inline deny policy (or attach as a managed policy) to all non-admin roles. This prevents unauthorized users from disabling versioning, modifying bucket policies, or changing replication settings:
 
 ```bash
 cat > /tmp/deny-dangerous.json << 'EOF'
@@ -542,25 +546,25 @@ aws iam put-role-policy \
   --profile account-a
 ```
 
-> **적용 범위**: S3 관리 권한이 필요 없는 모든 IAM role에 적용하세요 — 애플리케이션 role, CI/CD role, 개발자 role 등. 전용 관리자 break-glass role만 예외로 합니다.
+> **Scope**: Apply this policy to every IAM role that does not need administrative S3 control — application roles, CI/CD roles, developer roles, etc. Only a dedicated admin break-glass role should be exempt.
 
-### 4.2 Object Lock만으로 Account B가 보호되는 이유
+### 4.2 Why Object Lock Alone Protects Account B
 
-Account B의 Destination 버킷은 Step 2와 3에서 구성한 세 가지 계층으로 이미 보호되며, **어느 것도 AWS Organizations를 필요로 하지 않습니다**:
+Account B's destination bucket is already protected by three layers configured in Steps 2 and 3, **none of which require AWS Organizations**:
 
-| 보호 메커니즘 | 차단 대상 | root가 우회 가능? |
-|-------------|----------|-----------------|
-| **Object Lock Compliance 180일** | 잠긴 오브젝트 버전의 삭제 또는 수정 | **불가** — Compliance 모드는 절대적 |
-| **Object Lock (버킷 수준)** | 버킷에서 Object Lock 비활성화 | **불가** — 한번 활성화하면 제거 불가능 |
-| **Bucket Policy deny delete** | 모든 `DeleteObject` / `DeleteBucket` 호출 | 가능하지만, Object Lock이 여전히 실제 삭제를 차단 |
+| Protection | What it blocks | Can root bypass? |
+|-----------|---------------|-----------------|
+| **Object Lock Compliance 180d** | Delete or modify any locked object version | **No** — Compliance mode is absolute |
+| **Object Lock (bucket-level)** | Disabling Object Lock on the bucket | **No** — once enabled, cannot be removed |
+| **Bucket Policy deny delete** | All `DeleteObject` / `DeleteBucket` calls | Yes, but Object Lock still blocks actual deletion |
 
-핵심 인사이트: **Object Lock Compliance 모드는 S3에서 가장 강력한 보호**입니다 — root, IAM 정책, 버킷 정책 변경으로도 우회할 수 없습니다. 공격자가 Account B의 root 접근 권한을 얻어도 잠긴 오브젝트 버전은 삭제하거나 수정할 수 없습니다. 따라서 Organization 수준 제어(SCP)는 defense-in-depth로서 유용하지만 필수 조건은 아닙니다.
+The key insight: **Object Lock Compliance mode is the strongest protection available in S3** — it cannot be bypassed by root, IAM policies, or bucket policy changes. Even if an attacker gains root access to Account B, they cannot delete or modify locked object versions. This makes additional Organization-level controls (SCPs) a welcome layer of defense-in-depth but not a prerequisite.
 
-### 4.3 탐지 활성화: GuardDuty + CloudTrail
+### 4.3 Enable Detection: GuardDuty + CloudTrail
 
 ```bash
-# GuardDuty S3 Protection 활성화 (Account A)
-# GuardDuty가 이미 활성화된 경우, 기존 detector ID를 가져와서 업데이트합니다:
+# Enable GuardDuty with S3 Protection (Account A)
+# If GuardDuty is already enabled, get the existing detector ID and update it instead:
 #   DETECTOR_ID=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text --profile account-a)
 #   aws guardduty update-detector --detector-id ${DETECTOR_ID} \
 #     --features '[{"Name":"S3_DATA_EVENTS","Status":"ENABLED"}]' --profile account-a
@@ -569,15 +573,15 @@ aws guardduty create-detector \
   --features '[{"Name":"S3_DATA_EVENTS","Status":"ENABLED"}]' \
   --profile account-a
 
-# CloudTrail은 일반적으로 관리 이벤트에 대해 이미 활성화되어 있습니다.
-# S3 데이터 이벤트 모니터링 (선택 — API 호출량에 비례하여 비용 발생):
-# 본인 소유의 trail 이름을 확인합니다 (Organization 관리 trail 제외):
+# CloudTrail is typically already enabled for management events.
+# For S3 data event monitoring (optional — costs scale with API call volume):
+# Find your trail name and use one you own (skip organization-managed trails):
 #   aws cloudtrail describe-trails --query 'trailList[?IsOrganizationTrail==`false`].Name' --profile account-a
-# 본인 소유 trail이 없으면 먼저 생성합니다:
+# If you don't have your own trail, create one first:
 #   aws cloudtrail create-trail --name my-s3-trail \
 #     --s3-bucket-name my-cloudtrail-logs --profile account-a
 #   aws cloudtrail start-logging --name my-s3-trail --profile account-a
-TRAIL_NAME="my-s3-trail"  # 실제 trail 이름으로 교체
+TRAIL_NAME="my-s3-trail"  # Replace with your actual trail name
 aws cloudtrail put-event-selectors \
   --trail-name ${TRAIL_NAME} \
   --event-selectors '[{
@@ -591,13 +595,13 @@ aws cloudtrail put-event-selectors \
   --profile account-a
 ```
 
-### 4.4 (선택) AWS Organizations의 SCP로 보호 강화
+### 4.4 (Optional) Strengthen with SCPs via AWS Organizations
 
-두 계정이 동일 AWS Organization에 속해 있다면 **Service Control Policy(SCP)**를 추가하여 defense-in-depth를 구현할 수 있습니다. SCP는 Organization 수준에서 동작하며 IAM으로 우회할 수 없습니다 — 계정의 root 사용자도 포함됩니다.
+If both accounts belong to the same AWS Organization, you can add **Service Control Policies (SCPs)** for defense-in-depth. SCPs operate at the Organization level and cannot be bypassed by IAM — not even by the account's root user.
 
-> **참고**: SCP는 환경 변수를 지원하지 않습니다. 적용 전에 플레이스홀더(`<SOURCE_BUCKET>`, `<ACCOUNT_A>`, `<DEST_BUCKET>`, `<ACCOUNT_B>`)를 실제 값으로 교체하세요.
+> **Note**: SCPs do not support environment variables. Replace the placeholder values (`<SOURCE_BUCKET>`, `<ACCOUNT_A>`, `<DEST_BUCKET>`, `<ACCOUNT_B>`) with your actual values before applying.
 
-**Account A용 SCP** — Versioning 변경 및 대량 삭제 차단:
+**SCP for Account A** — prevent versioning changes and bulk deletes:
 
 ```json
 {
@@ -635,7 +639,7 @@ aws cloudtrail put-event-selectors \
 }
 ```
 
-**Account B용 SCP** — 삭제 및 Object Lock 변경 절대 차단:
+**SCP for Account B** — absolute deny on deletes and Object Lock changes:
 
 ```json
 {
@@ -677,31 +681,31 @@ aws cloudtrail put-event-selectors \
 }
 ```
 
-Organization 관리 계정에서 `aws organizations create-policy`와 `attach-policy`로 적용합니다.
+Apply using `aws organizations create-policy` and `attach-policy` from the Organization management account.
 
-> **언제 추가할 가치가 있는가?** SCP는 IAM deny 정책을 root나 IAM 관리자가 우회할 수 있는 Account A에서 가장 유용합니다. Account B는 Object Lock Compliance 모드가 이미 root도 우회 불가능한 보호를 제공하므로 — SCP는 추가 보호 계층이지만 필수는 아닙니다.
+> **When is this worth adding?** SCPs are most valuable for Account A, where IAM deny policies can be overridden by root or IAM admins. For Account B, Object Lock Compliance mode already provides root-proof protection — SCPs add an extra layer but are not essential.
 
 ---
 
-## Step 5: S3 Metadata와 Athena로 시점 복구(PITR) 구축
+## Step 5: Set Up Point-in-Time Recovery with S3 Metadata and Athena
 
-S3에는 DynamoDB처럼 네이티브 PITR이 없습니다. **S3 Metadata**(Apache Iceberg 테이블 기반 near real-time 변경 추적), **Athena**(버전 검색 SQL 쿼리), **S3 Batch Operations**(대량 복원)를 조합하여 구축합니다.
+S3 does not have native PITR like DynamoDB. We build it using **S3 Metadata** (near real-time change tracking via Apache Iceberg tables), **Athena** (SQL queries to find the right versions), and **S3 Batch Operations** (bulk restore).
 
-S3 Metadata는 두 가지 테이블을 제공합니다:
-- **Journal table**: 모든 오브젝트 변경(CREATE, UPDATE_METADATA, DELETE)을 **near real-time**으로 기록
-- **Live inventory table**: 전체 오브젝트의 **현재 상태**를 유지하며, 변경 후 ~1시간 내 반영
+S3 Metadata provides two table types:
+- **Journal table**: Records every object change (CREATE, UPDATE_METADATA, DELETE) in **near real-time**
+- **Live inventory table**: Maintains the **current state** of all objects, refreshed within ~1 hour
 
-### 5.1 Ops 버킷
+### 5.1 Ops Buckets
 
-Ops 버킷(`${OPS_BUCKET_A}`, `${OPS_BUCKET_B}`)은 **Step 2.4**에서 이미 생성했습니다. S3 Metadata 테이블은 AWS 관리형 테이블 버킷에 자동 저장되므로 메타데이터용 별도 버킷은 필요 없습니다.
+The ops buckets (`${OPS_BUCKET_A}` and `${OPS_BUCKET_B}`) were already created in **Step 2.4**. S3 Metadata tables are stored automatically in AWS managed table buckets — no additional bucket is needed for metadata.
 
-### 5.2 S3 Metadata 활성화 (양쪽 계정)
+### 5.2 Enable S3 Metadata (Both Accounts)
 
-**Journal table**(변경 추적)과 **Live inventory table**(현재 상태 스냅샷)을 각 버킷에 활성화합니다. 복구 기간에 맞춰 journal 레코드 만료를 90일로 설정합니다.
+Enable S3 Metadata with both **journal table** (change tracking) and **live inventory table** (current state snapshot) on each bucket. Set journal record expiration to 90 days to match the recovery window.
 
-> **참고:** `create-bucket-metadata-configuration` 명령어(V2 API)는 **AWS CLI v2.27.51 이상**이 필요합니다. `Invalid choice` 에러가 발생하면 `aws --version`으로 버전을 확인하고 [최신 AWS CLI v2로 업그레이드](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)하세요.
+> **Note:** The `create-bucket-metadata-configuration` command (V2 API) requires **AWS CLI v2.27.51 or later**. If you receive an `Invalid choice` error, check your version with `aws --version` and [upgrade to the latest AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
 
-**Account A — Source 버킷:**
+**Account A — Source Bucket:**
 
 ```bash
 cat > /tmp/metadata-config.json << 'EOF'
@@ -725,7 +729,7 @@ aws s3api create-bucket-metadata-configuration \
   --profile account-a
 ```
 
-**Account B — Destination 버킷:**
+**Account B — Destination Bucket:**
 
 ```bash
 aws s3api create-bucket-metadata-configuration \
@@ -735,7 +739,7 @@ aws s3api create-bucket-metadata-configuration \
   --profile account-b
 ```
 
-확인:
+Verify:
 
 ```bash
 aws s3api get-bucket-metadata-configuration \
@@ -744,30 +748,30 @@ aws s3api get-bucket-metadata-configuration \
   --profile account-a
 ```
 
-> **왜 양쪽 계정 모두에 S3 Metadata를 설정하는가?** Account A가 탈취되면 공격자가 Account A의 메타데이터 테이블도 삭제할 수 있습니다. Account B의 메타데이터는 최악의 시나리오에서도 PITR을 위한 독립적인 기록을 제공합니다.
+> **Why S3 Metadata on both accounts?** If Account A is compromised, the attacker can delete Account A's metadata tables. Account B's metadata provides an independent record for PITR even in the worst-case scenario.
 
-> **참고**: Live inventory 테이블을 처음 활성화하면 **backfilling** 프로세스가 진행됩니다 — Amazon S3가 버킷의 모든 기존 오브젝트 메타데이터를 스캔합니다. 버킷 크기에 따라 **15분에서 수 시간** 소요됩니다 (S3 Inventory의 48시간 대기보다 훨씬 빠름). Backfilling 완료 후 업데이트는 ~1시간 내에 반영됩니다. Backfilling에는 **오브젝트 100만 개당 $0.30**의 일회성 비용이 발생합니다 — 5억 개 오브젝트 기준으로 버킷당 ~$150 (양쪽 계정 합산 $300)입니다.
+> **Note**: When the live inventory table is first enabled, it goes through a **backfilling** process — Amazon S3 scans the bucket to retrieve initial metadata for all existing objects. This takes **15 minutes to several hours** depending on bucket size (much faster than S3 Inventory's 48-hour wait). After backfilling completes, updates are reflected within ~1 hour. Backfilling incurs a one-time cost of **$0.30 per million objects** — for 500 million objects, that is ~$150 per bucket ($300 total for both accounts).
 
-### 5.3 Athena 연동
+### 5.3 Integrate with Athena
 
-S3 Metadata 테이블은 AWS 관리형 테이블 버킷(`aws-s3`)에 Apache Iceberg 테이블로 저장됩니다. Athena로 쿼리하려면 테이블 버킷을 AWS 분석 서비스와 통합합니다.
+S3 Metadata tables are stored as Apache Iceberg tables in an AWS managed table bucket (`aws-s3`). To query them with Athena, integrate the table bucket with AWS analytics services.
 
-> **중요**: 이 단계를 **Account A와 Account B 모두**에서 수행하세요. Account B의 analytics integration은 Step 6.4의 재해 복구 시나리오에서 Account B의 메타데이터 테이블을 Account B의 Athena에서 직접 쿼리할 때 필요합니다.
+> **Important**: Perform these steps in **both Account A and Account B**. Account B's analytics integration is required for the disaster recovery scenario in Step 6.4, where you query Account B's metadata tables directly from Account B's Athena.
 
-1. **S3 콘솔** → **Table buckets** → `aws-s3` 테이블 버킷 선택
-2. **Integrations**에서 **Enable integration with AWS analytics services** 선택
-3. **Lake Formation**에서 Athena 쿼리를 실행할 IAM 사용자/역할에 메타데이터 테이블 네임스페이스에 대한 `SELECT` 권한 부여
+1. Open the **S3 console** → **Table buckets** → select the `aws-s3` table bucket
+2. Under **Integrations**, choose **Enable integration with AWS analytics services**
+3. In **Lake Formation**, grant `SELECT` permissions on the metadata table namespace to the IAM user/role that will run Athena queries
 
-연동 후 Athena에서 다음 형식으로 쿼리합니다:
+After integration, query metadata tables in Athena using:
 - **Catalog**: `s3tablescatalog/aws-s3`
-- **Database**: `b_<bucket-name>` (버킷 이름의 마침표는 밑줄로 변환)
-- **Tables**: `journal` (변경 로그) 또는 `inventory` (현재 상태)
+- **Database**: `b_<bucket-name>` (periods in bucket names become underscores)
+- **Tables**: `journal` (change log) or `inventory` (current state)
 
-연동 확인 테스트 쿼리:
+Verify with a test query:
 
 ```sql
--- Athena에서 Catalog를 s3tablescatalog/aws-s3로 설정
--- Database를 b_my-source-bucket으로 설정
+-- In Athena, set Catalog to: s3tablescatalog/aws-s3
+-- Set Database to: b_my-source-bucket
 
 SELECT record_type, count(*) as cnt
 FROM "s3tablescatalog/aws-s3"."b_my-source-bucket"."journal"
@@ -775,15 +779,15 @@ WHERE record_timestamp > current_date - interval '1' day
 GROUP BY record_type;
 ```
 
-### 5.4 PITR 쿼리: 특정 시점의 모든 오브젝트 조회
+### 5.4 PITR Query: Find All Objects at a Specific Point in Time
 
-핵심 쿼리입니다. 대상 타임스탬프를 기준으로 **inventory 테이블**(기준선)과 **journal 항목**(최근 변경분)을 결합하여 **해당 시점의 전체 버킷 상태를 재구성**합니다. 이 하이브리드 접근법이 필요한 이유는 journal이 S3 Metadata 활성화 이후의 변경만 기록하기 때문입니다 — 한 번도 수정되지 않은 기존 오브젝트는 journal-only 쿼리에서 누락됩니다.
+This is the core query. Given a target timestamp, it reconstructs the **complete bucket state at that point in time** by combining the **inventory table** (baseline of all objects) with **journal entries** (recent changes). This hybrid approach is necessary because the journal only records changes after S3 Metadata was enabled — pre-existing objects that were never modified would be missing from a journal-only query.
 
 ```sql
--- 대상: 2024-07-15 14:00:00 UTC로 복구
--- 하이브리드 접근법: inventory (기준선) + journal (최근 변경분)
+-- Target: restore to 2024-07-15 14:00:00 UTC
+-- Hybrid approach: inventory (baseline) + journal (recent changes)
 
--- Step 1: inventory와 journal 데이터의 경계 시점 결정
+-- Step 1: Determine the boundary between inventory and journal data
 WITH inventory_time_cte AS (
     SELECT COALESCE(inventory_time_from_property, inventory_time_default)
            AS inventory_time
@@ -800,9 +804,9 @@ WITH inventory_time_cte AS (
     )
 ),
 
--- Step 2: inventory (기준선) + journal (델타)로 작업 세트 구성
+-- Step 2: Build working set from inventory (baseline) + journal (delta)
 working_set AS (
-    -- 기준선: inventory 스냅샷의 모든 오브젝트
+    -- Baseline: all objects from inventory snapshot
     SELECT bucket, key, sequence_number, version_id, is_delete_marker,
            last_modified_date, size, storage_class,
            CAST(NULL AS varchar) AS record_type
@@ -811,7 +815,7 @@ working_set AS (
 
     UNION ALL
 
-    -- 델타: inventory 경계 이후의 journal 항목 (15분 오버랩 버퍼 포함)
+    -- Delta: journal entries since inventory boundary (with 15-min overlap buffer)
     SELECT bucket, key, sequence_number, version_id, is_delete_marker,
            COALESCE(last_modified_date, record_timestamp) AS last_modified_date,
            size, storage_class, record_type
@@ -821,7 +825,7 @@ working_set AS (
       AND j.last_modified_date <= TIMESTAMP '2024-07-15 14:00:00'
 ),
 
--- Step 3: 각 (key, version_id)별 version stack의 tip(최신 이벤트) 찾기
+-- Step 3: For each (key, version_id), find the tip of the version stack
 version_stacks AS (
     SELECT *,
       LEAD(sequence_number, 1) OVER (
@@ -834,16 +838,16 @@ version_tips AS (
     SELECT * FROM version_stacks WHERE next_sequence_number IS NULL
 ),
 
--- Step 4: 영구 삭제된 버전 제외 (delete marker와 live 버전은 유지)
+-- Step 4: Exclude permanently deleted versions (keep delete markers and live versions)
 existing_versions AS (
     SELECT * FROM version_tips
-    WHERE record_type IS NULL        -- inventory 행: 항상 유지
-       OR record_type != 'DELETE'    -- journal 비삭제 이벤트: 유지
-       OR is_delete_marker = TRUE    -- journal delete marker (소프트 삭제): 유지
-    -- 필터 대상: journal 영구 삭제 (record_type='DELETE', is_delete_marker=FALSE)
+    WHERE record_type IS NULL        -- inventory rows: always keep
+       OR record_type != 'DELETE'    -- journal non-delete events: keep
+       OR is_delete_marker = TRUE    -- journal delete markers (soft deletes): keep
+    -- Filters out: journal permanent deletes (record_type='DELETE', is_delete_marker=FALSE)
 ),
 
--- Step 5: 각 key별 최신 현존 버전 식별
+-- Step 5: For each key, find the latest existing version
 with_is_latest AS (
     SELECT *,
       sequence_number = MAX(sequence_number) OVER (
@@ -852,7 +856,7 @@ with_is_latest AS (
     FROM existing_versions
 )
 
--- Step 6: key별 최신 버전 선택, delete marker 제외
+-- Step 6: Pick the latest version per key, exclude delete markers
 SELECT
   bucket,
   key,
@@ -864,23 +868,23 @@ WHERE is_latest_version = TRUE
   AND COALESCE(is_delete_marker, FALSE) = FALSE;
 ```
 
-**쿼리 해석:**
-- **Step 1** — `journal$properties`의 `oldest-uncoalesced-record-timestamp`가 inventory 스냅샷 종료 시점과 journal 레코드 시작 시점의 경계를 제공합니다. 쿼리에 하드코딩된 `2024-12-01 00:00`은 fallback 기본값일 뿐입니다 — `COALESCE()`를 통해 `journal$properties`에서 실제 경계 시점을 자동으로 읽어오므로, 대부분의 경우 이 값을 변경할 필요가 없습니다. 만약 `journal$properties`에 아직 타임스탬프가 없는 경우(예: inventory backfill이 진행 중), fallback 값을 해당 버킷에 S3 Metadata를 활성화한 대략적인 시점으로 변경하세요.
-- **Step 2** — Inventory가 **모든 오브젝트**(S3 Metadata 이전 오브젝트 포함)의 기준선을 제공합니다. Journal은 inventory 경계 이후의 최근 변경분만 추가하며, 15분 오버랩 버퍼로 gap을 방지합니다.
-- **Step 3** — `PARTITION BY bucket, key, coalesce(version_id, '')`로 각 오브젝트 버전별 "version stack"을 구축합니다([AWS 문서 패턴](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-example-queries.html)). `LEAD()`로 다음 이벤트를 찾고, NULL이면 해당 버전의 최신 이벤트(tip)입니다.
-- **Step 4** — 영구 삭제된 버전(journal의 `record_type='DELETE'` + `is_delete_marker=FALSE`)을 제거합니다. Inventory 행(`record_type IS NULL`)은 항상 유지됩니다. 이렇게 하면 Lifecycle noncurrent version expiration이 현재 버전을 가리는 문제를 방지합니다.
-- **Step 5–6** — 살아남은 버전 중 각 key별 최신 버전을 선택하고, delete marker(해당 시점에 삭제된 오브젝트)를 제외합니다.
+**How to read this query:**
+- **Step 1** — `journal$properties` provides the `oldest-uncoalesced-record-timestamp`, marking where the inventory snapshot ends and journal records begin. The hardcoded `2024-12-01 00:00` is only a fallback default — the query automatically reads the actual boundary from `journal$properties` via `COALESCE()`, so in most cases you do not need to change this value. If `journal$properties` does not yet contain the timestamp (e.g., the inventory backfill is still in progress), replace the fallback with the approximate time you enabled S3 Metadata on the bucket.
+- **Step 2** — Inventory provides the baseline of **all objects** (including those that predate S3 Metadata). Journal adds only recent changes since the inventory boundary, with a 15-minute overlap buffer to prevent gaps.
+- **Step 3** — `PARTITION BY bucket, key, coalesce(version_id, '')` builds a "version stack" for each object version ([AWS documentation pattern](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-example-queries.html)). `LEAD()` finds the next event; NULL means this row is the tip (most recent event).
+- **Step 4** — Remove permanently deleted versions (`record_type='DELETE'` with `is_delete_marker=FALSE` in journal) so that Lifecycle noncurrent version expiration doesn't mask the current version. Inventory rows (`record_type IS NULL`) are always kept.
+- **Step 5–6** — Among surviving versions, pick the latest per key and exclude delete markers (object was deleted at target time).
 
-> **왜 inventory + journal인가?** Journal은 S3 Metadata **활성화 이후**의 변경만 기록합니다. 한 번도 수정되지 않은 기존 오브젝트에는 journal 항목이 없습니다. Inventory 테이블은 백필을 통해 모든 오브젝트를 포함하므로, 완전한 PITR에 필수적입니다. 또한 journal 레코드는 만료됩니다(이 아키텍처에서 90일). 오래된 CREATE 이벤트는 결국 사라지므로, journal만으로는 제공할 수 없는 안정적인 기준선을 inventory 테이블이 제공합니다.
+> **Why inventory + journal?** The journal only records changes **after S3 Metadata was enabled**. Pre-existing objects that were never modified have no journal entry. The inventory table includes all objects via backfill, making it essential for complete PITR. Additionally, journal records expire (90 days in this architecture), so older CREATE events are eventually lost. The inventory table provides the stable baseline that the journal alone cannot.
 
-> **성능 이점**: 5억 개 오브젝트 버킷에서 이 접근법은 대부분의 상태를 사전 집계된 inventory에서 읽고 최근 journal 델타만 스캔하므로, 전체 journal 스캔 대비 Athena 비용을 **90% 이상 절감**합니다.
+> **Performance benefit**: For a 500M-object bucket, this approach reads the bulk of state from the pre-aggregated inventory and scans only the recent journal delta, reducing Athena costs by **90%+** compared to a full journal scan.
 
-### 5.5 변형: 삭제된 오브젝트도 포함하여 복구
+### 5.5 Variant: Include Deleted Objects (Restore Them Too)
 
-랜섬웨어가 덮어쓰기 전에 오브젝트를 삭제한 경우, 삭제된 오브젝트도 복구할 수 있습니다. 이 쿼리는 5.4를 확장하여, 최신 버전이 delete marker인 오브젝트도 가장 최근의 비삭제 버전을 찾아 복구합니다:
+If ransomware deleted objects before overwriting, you may want to restore those as well. This query extends 5.4 by also recovering objects whose latest version is a delete marker, finding their most recent non-deleted version:
 
 ```sql
--- 5.4와 동일한 하이브리드 working_set (inventory 기준선 + journal 델타)
+-- Same hybrid working_set as 5.4 (inventory baseline + journal delta)
 WITH inventory_time_cte AS (
     SELECT COALESCE(inventory_time_from_property, inventory_time_default)
            AS inventory_time
@@ -933,14 +937,14 @@ with_is_latest AS (
       sequence_number = MAX(sequence_number) OVER (PARTITION BY bucket, key) AS is_latest_version
     FROM existing_versions
 ),
--- 대상 시점에 살아있는 오브젝트
+-- Objects alive at target time
 alive AS (
     SELECT bucket, key, version_id, size
     FROM with_is_latest
     WHERE is_latest_version = TRUE
       AND COALESCE(is_delete_marker, FALSE) = FALSE
 ),
--- 대상 시점에 삭제된 오브젝트 — 가장 최근의 비삭제 버전으로 복구
+-- Objects deleted at target time — recover the most recent non-delete-marker version
 deleted_keys AS (
     SELECT key FROM with_is_latest
     WHERE is_latest_version = TRUE
@@ -958,9 +962,9 @@ UNION ALL
 SELECT bucket, key, version_id, size FROM deleted_restore WHERE restore_rn = 1;
 ```
 
-### 5.6 현재 상태 쿼리 (Live Inventory 테이블)
+### 5.6 Current State Query (Live Inventory Table)
 
-현재 버킷 상태를 빠르게 확인할 때 — 예를 들어 현재 오브젝트 수를 확인할 때 — live inventory 테이블을 사용합니다:
+For quick verification of the current bucket state — e.g., confirming how many objects exist right now — use the live inventory table:
 
 ```sql
 SELECT storage_class, count(*) as object_count, sum(size) as total_bytes
@@ -969,24 +973,24 @@ WHERE NOT is_delete_marker
 GROUP BY storage_class;
 ```
 
-Live inventory 테이블은 ~1시간 내에 갱신되며, Step 5.2에서 활성화한 것 외에 별도 설정이 필요 없습니다.
+The live inventory table is refreshed within ~1 hour and does not require any manual setup beyond enabling it in Step 5.2.
 
 ---
 
-## Step 6: 시점 복구 실행
+## Step 6: Execute a Point-in-Time Recovery
 
-인시던트 발생 시, 이 런북을 따라 특정 시점으로 데이터를 복원합니다.
+When an incident occurs, follow this runbook to restore data to a specific point in time.
 
-> **시작 전 확인**: 아래 예시는 PITR 대상 시점으로 `2024-07-15 14:00:00`을, S3 경로에 `2024-07-15T14`(예: `pitr-manifests/2024-07-15T14/`)을 사용합니다. 다른 시점으로 복원할 경우, SQL 쿼리의 `TIMESTAMP` 값 **과** bash 명령어의 S3 경로를 **모두** 대상 날짜에 맞게 변경하세요.
+> **Before you begin**: The examples below use `2024-07-15 14:00:00` as the PITR target timestamp and `2024-07-15T14` in S3 paths (e.g., `pitr-manifests/2024-07-15T14/`). When restoring to a different point in time, update **both** the `TIMESTAMP` values in the SQL query **and** the S3 paths in the bash commands to match your target date.
 
-### 6.1 PITR Manifest 생성
+### 6.1 Generate the PITR Manifest
 
-Athena에서 PITR 쿼리를 실행하고, 자동 생성되는 CSV 결과 파일을 manifest로 사용합니다. Athena는 모든 SELECT 결과를 워크그룹의 쿼리 결과 위치에 CSV 파일로 저장합니다.
+Run the PITR query in Athena and use the automatically generated CSV result file as the manifest. Athena saves every SELECT result as a CSV file in the workgroup's query result location.
 
-> **참고**: S3 Metadata 테이블은 `s3tablescatalog`에 있으며, 이 카탈로그는 Iceberg 포맷(AVRO, ORC, PARQUET)만 지원합니다 — `TEXTFILE` 포맷의 CTAS는 지원되지 않습니다. 대신 일반 `SELECT`를 실행하고 결과 CSV를 후처리합니다.
+> **Note**: S3 Metadata tables live in `s3tablescatalog`, which only supports Iceberg formats (AVRO, ORC, PARQUET) — CTAS with `TEXTFILE` format is not supported when querying from this catalog. Instead, we run a plain `SELECT` and post-process the result CSV.
 
 ```sql
--- Athena에서 실행: Catalog: s3tablescatalog/aws-s3, Database: b_my-source-bucket
+-- Run in Athena with Catalog: s3tablescatalog/aws-s3, Database: b_my-source-bucket
 WITH inventory_time_cte AS (
     SELECT COALESCE(inventory_time_from_property, inventory_time_default)
            AS inventory_time
@@ -1047,33 +1051,33 @@ WHERE is_latest_version = TRUE
   AND COALESCE(is_delete_marker, FALSE) = FALSE;
 ```
 
-쿼리 완료 후, Athena 쿼리 결과 위치에서 결과 CSV를 다운로드하고 헤더 행을 제거한 뒤 manifest로 업로드합니다:
+After the query completes, download the result CSV from the Athena query result location, strip the header row, and upload it as the manifest:
 
 ```bash
-# 결과 S3 경로 복사: Athena 콘솔 > Recent queries > 쿼리 선택 > Output location
-# 경로는 워크그룹 설정에 따라 다릅니다 (예: Unsaved/2024/07/15/<query-id>.csv 또는 query-results/<query-id>.csv)
-QUERY_RESULT="s3://${OPS_BUCKET_A}/Unsaved/2024/07/15/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.csv"  # ← 실제 Output location으로 변경
+# Copy the result S3 path from: Athena console > Recent queries > select your query > Output location
+# The path varies by workgroup settings (e.g., Unsaved/2024/07/15/<query-id>.csv or query-results/<query-id>.csv)
+QUERY_RESULT="s3://${OPS_BUCKET_A}/Unsaved/2024/07/15/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.csv"  # ← replace with actual Output location
 
 aws s3 cp "${QUERY_RESULT}" /tmp/pitr-result.csv --profile account-a
-tail -n +2 /tmp/pitr-result.csv > /tmp/pitr-manifest.csv    # 헤더 행 제거
+tail -n +2 /tmp/pitr-result.csv > /tmp/pitr-manifest.csv    # strip header row
 aws s3 cp /tmp/pitr-manifest.csv s3://${OPS_BUCKET_A}/pitr-manifests/2024-07-15T14/manifest.csv --profile account-a
 ```
 
-> **S3 키의 콤마**: Athena의 CSV 출력은 필드 값을 따옴표로 감싸므로, S3 키 내 콤마는 정상 처리됩니다. 다만 키에 콤마와 큰따옴표가 모두 포함된 경우, 진행 전에 manifest 파일을 확인하세요.
+> **Comma in S3 keys**: Athena's CSV output quotes field values, so commas within S3 keys are handled correctly. However, if your keys contain both commas and double quotes, verify the manifest file before proceeding.
 
-### 6.2 Batch Operations 복원 Job 생성
+### 6.2 Create the Batch Operations Restore Job
 
-먼저 복원용 버킷을 생성한 후, Batch Operations job으로 특정 버전을 복사합니다:
+Create a restore bucket first, then run the Batch Operations job to copy the specific versions:
 
 ```bash
-# 복원 버킷 생성 (us-east-1의 경우 --create-bucket-configuration 생략)
+# Create a restore bucket (for us-east-1, omit --create-bucket-configuration)
 aws s3api create-bucket \
   --bucket ${RESTORE_BUCKET_A} \
   --region ${REGION} \
   --create-bucket-configuration LocationConstraint=${REGION} \
   --profile account-a
 
-# Batch Operations IAM role 생성
+# Create the Batch Operations IAM role
 cat > /tmp/batch-trust.json << 'EOF'
 {
   "Version": "2012-10-17",
@@ -1136,17 +1140,17 @@ aws iam put-role-policy \
   --profile account-a
 ```
 
-Batch Operations job을 생성합니다:
+Now create the Batch Operations job:
 
 ```bash
-# Manifest 파일의 ETag 조회
+# Get the manifest file ETag
 MANIFEST_ETAG=$(aws s3api head-object \
   --bucket ${OPS_BUCKET_A} \
   --key pitr-manifests/2024-07-15T14/manifest.csv \
   --query ETag --output text \
   --profile account-a | tr -d '"')
 
-# Batch Operations job 생성
+# Create the Batch Operations job
 aws s3control create-job \
   --account-id ${ACCOUNT_A} \
   --operation '{
@@ -1180,15 +1184,15 @@ aws s3control create-job \
   --profile account-a
 ```
 
-### 6.3 복원 Job 확인 및 모니터링
+### 6.3 Confirm and Monitor the Restore Job
 
-`--confirmation-required`를 사용했으므로 job은 **Suspended** 상태로 생성됩니다. 실행을 시작하려면 확인이 필요합니다:
+Since we used `--confirmation-required`, the job starts in a **Suspended** state. Confirm it to begin execution:
 
 ```bash
-# create-job 출력에서 job ID를 받기
+# Get the job ID from the create-job output
 JOB_ID="your-job-id-here"
 
-# "Suspended" 상태 대기 후 실행 승인
+# Wait for "Suspended" status, then confirm the job
 aws s3control describe-job \
   --account-id ${ACCOUNT_A} \
   --job-id ${JOB_ID} \
@@ -1196,7 +1200,7 @@ aws s3control describe-job \
   --region ${REGION} \
   --profile account-a
 
-# Job 실행 확인
+# Confirm the job to start execution
 aws s3control update-job-status \
   --account-id ${ACCOUNT_A} \
   --job-id ${JOB_ID} \
@@ -1204,7 +1208,7 @@ aws s3control update-job-status \
   --region ${REGION} \
   --profile account-a
 
-# 진행 상황 모니터링:
+# Monitor progress:
 aws s3control describe-job \
   --account-id ${ACCOUNT_A} \
   --job-id ${JOB_ID} \
@@ -1213,21 +1217,21 @@ aws s3control describe-job \
   --profile account-a
 ```
 
-### 6.4 재해 복구: Account B에서 복원
+### 6.4 Disaster Recovery: Restore from Account B
 
-Account A가 탈취된 경우, Account B의 메타데이터를 사용하여 동일한 프로세스를 실행합니다:
+If Account A is compromised, run the same process from Account B using Account B's metadata.
 
-**사전 준비**: Account B에 복원 버킷과 Batch Operations IAM role을 생성합니다 (Step 6.2의 Account A role과 동일 구조, Account B 버킷 참조):
+**Pre-requisite**: Create a restore bucket and the Batch Operations IAM role in Account B (same structure as Account A's role in Step 6.2, but referencing Account B's buckets):
 
 ```bash
-# Account B에 복원 버킷 생성 (us-east-1의 경우 --create-bucket-configuration 생략)
+# Create a restore bucket in Account B (for us-east-1, omit --create-bucket-configuration)
 aws s3api create-bucket \
   --bucket ${RESTORE_BUCKET_B} \
   --region ${REGION} \
   --create-bucket-configuration LocationConstraint=${REGION} \
   --profile account-b
 
-# Account B에 Batch Ops role 생성 (Account A와 동일한 trust policy)
+# Create Batch Ops role in Account B (same trust policy as Account A)
 aws iam create-role \
   --role-name s3-batch-restore-role \
   --assume-role-policy-document file:///tmp/batch-trust.json \
@@ -1268,10 +1272,10 @@ aws iam put-role-policy \
   --profile account-b
 ```
 
-Account B의 journal에서 PITR manifest를 생성합니다 (Step 6.1과 동일한 SELECT 방식):
+Generate the PITR manifest from Account B's journal (same SELECT approach as Step 6.1):
 
 ```sql
--- Account B의 Athena에서 실행
+-- Run in Account B's Athena
 -- Catalog: s3tablescatalog/aws-s3, Database: b_my-backup-bucket
 WITH inventory_time_cte AS (
     SELECT COALESCE(inventory_time_from_property, inventory_time_default)
@@ -1333,18 +1337,18 @@ WHERE is_latest_version = TRUE
   AND COALESCE(is_delete_marker, FALSE) = FALSE;
 ```
 
-Destination이 **Glacier Deep Archive**를 사용하므로 복사 전에 먼저 오브젝트를 복원해야 합니다. 2단계 Batch Operations 프로세스가 필요합니다.
+Since the destination uses **Glacier Deep Archive**, objects must be restored before copying. This requires a two-step Batch Operations process.
 
-먼저 Athena 쿼리 결과를 다운로드하고 헤더를 제거한 뒤 manifest로 업로드합니다 (Step 6.1과 동일한 프로세스):
+First, download the Athena query result, strip the header, and upload as the manifest (same process as Step 6.1):
 
 ```bash
-# 결과 S3 경로 복사: Athena 콘솔 > Recent queries > 쿼리 선택 > Output location
-QUERY_RESULT_B="s3://${OPS_BUCKET_B}/Unsaved/2024/07/15/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.csv"  # ← 실제 Output location으로 변경
+# Copy the result S3 path from: Athena console > Recent queries > select your query > Output location
+QUERY_RESULT_B="s3://${OPS_BUCKET_B}/Unsaved/2024/07/15/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.csv"  # ← replace with actual Output location
 aws s3 cp "${QUERY_RESULT_B}" /tmp/pitr-result-dr.csv --profile account-b
 tail -n +2 /tmp/pitr-result-dr.csv > /tmp/pitr-manifest-dr.csv
 aws s3 cp /tmp/pitr-manifest-dr.csv s3://${OPS_BUCKET_B}/pitr-manifests/dr-2024-07-15/manifest.csv --profile account-b
 
-# Manifest ETag 조회
+# Get the manifest ETag
 MANIFEST_ETAG=$(aws s3api head-object \
   --bucket ${OPS_BUCKET_B} \
   --key pitr-manifests/dr-2024-07-15/manifest.csv \
@@ -1352,10 +1356,10 @@ MANIFEST_ETAG=$(aws s3api head-object \
   --profile account-b | tr -d '"')
 ```
 
-**Step 1: 아카이브 복원 시작 (Bulk = 48시간, Standard = 12시간)**
+**Step 1: Initiate restore (Bulk = 48h, Standard = 12h)**
 
 ```bash
-# Batch Operations 아카이브 복원 job 생성
+# Create the Batch Operations restore-from-archive job
 aws s3control create-job \
   --account-id ${ACCOUNT_B} \
   --operation '{
@@ -1389,7 +1393,7 @@ aws s3control create-job \
   --profile account-b
 ```
 
-Job을 확인하여 실행을 시작하고, 모든 복원이 완료될 때까지 모니터링합니다 (Step 6.3과 동일):
+Confirm the job to start execution, then monitor until all restores complete (same process as Step 6.3):
 
 ```bash
 aws s3control update-job-status \
@@ -1400,26 +1404,26 @@ aws s3control update-job-status \
   --profile account-b
 ```
 
-> **검색 티어 선택**: 전체 규모 DR에는 `BULK`(48시간)을 사용하세요 — 가장 저렴하며 Glacier IR보다도 비용이 낮습니다. 빠른 접근이 필요한 소규모 개별 복원에는 `STANDARD`(12시간)를 사용할 수 있으며, 요청당 비용이 더 높습니다.
+> **Choosing retrieval tier**: Use `BULK` (48 hours) for full-scale DR — it is the cheapest option and actually costs less than Glacier IR. Use `STANDARD` (12 hours) for smaller, time-sensitive restores where faster access justifies the higher per-request cost.
 
-> **중요 — 2단계 복원 프로세스**: `S3InitiateRestoreObject` Batch Operations 작업은 모든 복원 **요청 제출**이 완료되면 Complete로 표시됩니다 — 이것은 오브젝트에 접근할 수 있다는 의미가 **아닙니다**. 실제 Glacier Deep Archive 복원은 작업 완료 후 **12시간(Standard)** 또는 **48시간(Bulk)**이 소요됩니다. 복원이 완료될 때까지 기다린 후 Step 2를 진행해야 합니다.
+> **Important — two-phase restore process**: The Batch Operations job for `S3InitiateRestoreObject` completes when all restore **requests** have been submitted — this does NOT mean the objects are ready to access. The actual Glacier Deep Archive restore takes **12 hours (Standard)** or **48 hours (Bulk)** after the job completes. You must wait for the restore to finish before proceeding to Step 2.
 
-**Glacier 복원 진행 상태 모니터링:**
+**Monitor Glacier restore progress:**
 
-S3는 각 오브젝트의 복원이 완료될 때마다 EventBridge를 통해 `s3:ObjectRestore:Completed` 이벤트를 전송합니다. EventBridge 규칙을 설정하여 완료 수를 카운트하고 모든 오브젝트가 준비되면 알림을 받을 수 있습니다.
+S3 sends an `s3:ObjectRestore:Completed` event via EventBridge for **each** object that finishes restoring. Set up an EventBridge rule to count completions and receive a notification when all objects are ready.
 
-**옵션 A: EventBridge + CloudWatch 카운터 (전체 오브젝트 확인에 권장)**
+**Option A: EventBridge + CloudWatch counter (recommended for full visibility)**
 
-`ObjectRestore:Completed` 이벤트를 CloudWatch 메트릭으로 카운트하는 EventBridge 규칙을 생성합니다. 메트릭 카운트가 manifest의 총 오브젝트 수와 일치하면 모든 복원이 완료된 것입니다.
+Create an EventBridge rule that counts `ObjectRestore:Completed` events via a CloudWatch metric. When the metric count matches the total number of objects in the manifest, all restores are complete.
 
 ```bash
-# 1. 백업 버킷에 EventBridge 알림 활성화
+# 1. Enable EventBridge notifications on the backup bucket
 aws s3api put-bucket-notification-configuration \
   --bucket ${DEST_BUCKET} \
   --notification-configuration '{"EventBridgeConfiguration": {}}' \
   --profile account-b
 
-# 2. 복원 완료를 카운트하는 EventBridge 규칙 생성
+# 2. Create EventBridge rule to count restore completions
 aws events put-rule \
   --name "s3-restore-completed" \
   --event-pattern '{
@@ -1430,20 +1434,36 @@ aws events put-rule \
   --region ${REGION} \
   --profile account-b
 
-# 3. (선택) SNS 타겟을 추가하여 오브젝트별 이메일 알림 수신
+# 3. (Optional) Add an SNS target to receive email notification per object
 # aws events put-targets --rule "s3-restore-completed" --targets '[{"Id":"sns","Arn":"arn:aws:sns:'${REGION}':'${ACCOUNT_B}':restore-notify"}]'
 ```
 
-**CloudWatch** → **Metrics** → **Events** → **TriggeredRules**에서 `s3-restore-completed` 규칙의 카운트를 모니터링하고, manifest의 총 라인 수와 비교합니다:
+Monitor the restore count in **CloudWatch** → **Metrics** → **Events** → **TriggeredRules** for the `s3-restore-completed` rule, and compare it with the total manifest line count:
 
 ```bash
-# 복원 대상 총 오브젝트 수
+# Restore-completed count (TriggeredRules metric for the last 1 hour)
+# macOS: replace -d '1 hour ago' with -v-1H
+aws cloudwatch get-metric-statistics \
+  --namespace "AWS/Events" \
+  --metric-name "TriggeredRules" \
+  --dimensions Name=RuleName,Value=s3-restore-completed \
+  --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+  --period 3600 \
+  --statistics Sum \
+  --region ${REGION} \
+  --profile account-b \
+  --query 'Datapoints[0].Sum' --output text
+
+# Total objects to restore
 wc -l < /tmp/pitr-manifest-dr.csv
 ```
 
-**옵션 B: manifest의 여러 지점에서 샘플 확인 (간편 방법)**
+> **Note:** The EventBridge rule must be created **before** the restore completes. If the rule is created after restores have already finished, the `TriggeredRules` metric will return `None` because past events are not captured retroactively. In that case, use Option B below to verify restore status.
 
-EventBridge 설정 없이 빠르게 확인하려면, manifest의 처음, 중간, 마지막 오브젝트를 확인합니다:
+**Option B: Spot-check multiple samples from the manifest**
+
+For a quick check without setting up EventBridge, verify objects from the beginning, middle, and end of the manifest:
 
 ```bash
 TOTAL=$(wc -l < /tmp/pitr-manifest-dr.csv)
@@ -1456,14 +1476,21 @@ for LINE in 1 $((TOTAL/2)) $TOTAL; do
 done
 ```
 
-- `ongoing-request="true"` → 복원 진행 중, **대기 후 재확인**
-- `ongoing-request="false", expiry-date="..."` → 복원 완료
+- `ongoing-request="true"` → restore still in progress, **wait and retry later**
+- `ongoing-request="false", expiry-date="..."` → restore complete
 
-모든 샘플이 `ongoing-request="false"`를 표시하면 Step 2를 진행합니다. 대규모 복원(수백만 오브젝트)의 경우, 옵션 A가 확실한 확인 방법입니다.
+When all samples show `ongoing-request="false"`, proceed to Step 2. For large restores (millions of objects), Option A provides definitive confirmation.
 
-**Step 2: 복원된 오브젝트를 새 버킷에 복사 (복원 완료 후)**
+**Step 2: Copy restored objects to a new bucket (after restore completes)**
 
 ```bash
+# Re-fetch the manifest ETag (in case the shell session has changed since Step 1)
+MANIFEST_ETAG=$(aws s3api head-object \
+  --bucket ${OPS_BUCKET_B} \
+  --key pitr-manifests/dr-2024-07-15/manifest.csv \
+  --query ETag --output text \
+  --profile account-b | tr -d '"')
+
 aws s3control create-job \
   --account-id ${ACCOUNT_B} \
   --operation '{
@@ -1497,7 +1524,7 @@ aws s3control create-job \
   --profile account-b
 ```
 
-이 Job도 동일하게 확인하고 모니터링합니다:
+Confirm and monitor this job as well:
 
 ```bash
 aws s3control update-job-status \
@@ -1508,83 +1535,103 @@ aws s3control update-job-status \
   --profile account-b
 ```
 
-> **DR 완료 확인**: **S3 콘솔** → **Batch Operations** → 복사 작업을 선택합니다. 상태가 **Complete**이고 **Successful** 수가 **Total** 수와 일치하면 DR 복구가 완료된 것입니다. `${RESTORE_BUCKET_B}` 버킷에서 복원된 오브젝트를 확인하세요.
+> **Verify DR completion**: Open the **S3 console** → **Batch Operations** → select the copy job. When the status shows **Complete** and the **Successful** count matches the **Total** count, the DR recovery is finished. Verify the restored objects in the `${RESTORE_BUCKET_B}` bucket.
+
+You can also verify from the CLI:
+
+```bash
+# Check copy job status (replace <COPY_JOB_ID> with the job ID returned above)
+aws s3control describe-job \
+  --account-id ${ACCOUNT_B} \
+  --job-id <COPY_JOB_ID> \
+  --region ${REGION} \
+  --profile account-b \
+  --query 'Job.{Status:Status,Total:ProgressSummary.TotalNumberOfTasks,Succeeded:ProgressSummary.NumberOfTasksSucceeded,Failed:ProgressSummary.NumberOfTasksFailed}'
+
+# (Optional) Verify objects in the restore bucket
+# For large-scale buckets (hundreds of millions of objects), this command may
+# incur significant LIST request costs and take a long time to complete.
+# In that case, rely on the describe-job output above instead.
+# aws s3 ls s3://${RESTORE_BUCKET_B}/ --recursive --summarize --profile account-b
+```
+
+When `Status` is `Complete` and `Succeeded` matches `Total`, the DR recovery is finished.
 
 ---
 
-## 복구 비용 추정
+## Recovery Cost Estimates
 
-**Source에서 복구 (Account A)** — noncurrent 버전은 Glacier IR, 즉시 접근 가능:
+**From Source (Account A)** — noncurrent versions in Glacier IR, immediate access:
 
-| 복구 규모 | Batch Ops | GET 요청 (Glacier IR) | 데이터 검색 (Glacier IR) | Athena | 합계 |
-|-----------|-----------|---------------------|------------------------|--------|------|
-| 100개 오브젝트 (실수) | ~$0 | ~$0 | ~$0 | $0.03 | **~$0** |
-| 100만 오브젝트 (부분) | $1.25 | $10 | ~$300 | $0.03 | **~$311** |
-| 5억 오브젝트 (전체 DR) | $500 | $5,000 | $15,000 | $0.03 | **~$20,500** |
+| Recovery Scale | Batch Ops | GET Requests (Glacier IR) | Data Retrieval (Glacier IR) | Athena | Total |
+|---------------|-----------|--------------------------|----------------------------|--------|-------|
+| 100 objects (accidental) | ~$0 | ~$0 | ~$0 | $0.03 | **~$0** |
+| 1M objects (partial) | $1.25 | $10 | ~$300 | $0.03 | **~$311** |
+| 500M objects (full DR) | $500 | $5,000 | $15,000 | $0.03 | **~$20,500** |
 
-**Destination에서 복구 (Account B)** — Deep Archive, 복원 필요:
+**From Destination (Account B)** — Deep Archive, restore required:
 
-| 복구 규모 | Batch Ops (2 jobs) | 복원 + 검색 (Bulk, 48시간) | 복원 + 검색 (Standard, 12시간) | Athena | 합계 (Bulk) |
-|-----------|-------------------|--------------------------|-------------------------------|--------|------------|
-| 100개 오브젝트 | ~$1 | ~$0 | ~$0 | $0.03 | **~$1** |
-| 100만 오브젝트 (10TB) | $2.50 | ~$50 | ~$300 | $0.03 | **~$53** |
-| 5억 오브젝트 (전체 DR) | $1,001 | $13,750 | $60,000 | $0.03 | **~$14,751** |
-
----
-
-## PITR 정밀도와 한계
-
-| 항목 | 상세 |
-|------|------|
-| **복구 정밀도** | 모든 타임스탬프 — journal이 near real-time으로 변경 기록 |
-| **초기 설정 시간** | Live inventory backfill: 15분~수 시간 (S3 Inventory의 48시간 대비) |
-| **Journal 레코드 보존** | 설정 가능 — 본 아키텍처에서 90일 (최소 7일) |
-| **RPO (복구 시점 목표)** | **Near real-time** — journal이 모든 오브젝트 변경을 발생 즉시 캡처 |
-
-> **참고**: 오브젝트 변경이 많은 장기간 PITR 쿼리는 journal 테이블 스캔 비용이 높을 수 있습니다. 항상 `record_timestamp` 범위 필터를 포함하여 스캔 범위를 제한하세요. 현재 상태 쿼리는 전체 journal 스캔 대신 live inventory 테이블을 사용하세요.
+| Recovery Scale | Batch Ops (2 jobs) | Restore + Retrieval (Bulk, 48h) | Restore + Retrieval (Standard, 12h) | Athena | Total (Bulk) |
+|---------------|-------------------|--------------------------------|-------------------------------------|--------|-------------|
+| 100 objects | ~$1 | ~$0 | ~$0 | $0.03 | **~$1** |
+| 1M objects (10 TB) | $2.50 | ~$50 | ~$300 | $0.03 | **~$53** |
+| 500M objects (full DR) | $1,001 | $13,750 | $60,000 | $0.03 | **~$14,751** |
 
 ---
 
-## 구현 우선순위
+## PITR Precision and Limitations
 
-| 단계 | 작업 | 일정 | 비용 영향 |
-|------|------|------|----------|
-| **즉시** | Versioning 활성화, IAM deny 정책으로 Versioning 보호 | Day 1 | $0 |
-| **1주차** | Account B 생성, Object Lock이 적용된 Destination 버킷 구성 | 1주차 | 복제 시작 전까지 $0 |
-| **2주차** | Cross-account SRR 설정, 양쪽 계정 S3 Metadata 활성화 | 2주차 | ~$600/월 시작 |
-| **3주차** | 기존 오브젝트 Batch Replication 실행, Athena 테이블 생성 | 3주차 | 일회성 복제 요청 비용 |
-| **4주차** | PITR 복원 테스트 (부분), 런북 문서화, GuardDuty 활성화 | 4주차 | 테스트 복원 ~$15 |
+| Factor | Detail |
+|--------|--------|
+| **Recovery granularity** | Any timestamp — journal records changes in near real-time |
+| **Initial setup time** | Live inventory backfill: 15 minutes to several hours (vs. 48 hours for S3 Inventory) |
+| **Journal record retention** | Configurable — set to 90 days in this architecture (minimum 7 days) |
+| **RPO (Recovery Point Objective)** | **Near real-time** — journal captures every object mutation as it happens |
 
----
-
-## 최종 월간 비용 요약
-
-| 항목 | 월 비용 |
-|------|--------|
-| Destination 스토리지 (Deep Archive, 500TB) | $495 |
-| S3 Metadata journal — Account A (~0.1–1% 일별 변경률) | $5–45 |
-| S3 Metadata journal — Account B (~0.1–1% 일별 변경률) | $5–45 |
-| S3 Metadata live inventory (10억 미만 무료) | $0 |
-| 데이터 전송 (동일 리전 SRR) | $0 |
-| Object Lock / Versioning / IAM deny 정책 | $0 |
-| CloudTrail (관리 이벤트) + GuardDuty | ~$10 |
-| **총 추가 비용** | **~$515–595/월** |
+> **Note**: For PITR queries spanning a long time range with high object churn, journal table scans can be expensive. Always include a `record_timestamp` range filter to limit the scan window. For current state queries, use the live inventory table instead of scanning the full journal.
 
 ---
 
-## 결론
+## Implementation Priority
 
-S3 Versioning, Cross-Account 동일 리전 복제, Object Lock(Compliance 모드), IAM deny 정책, S3 Metadata, Athena, S3 Batch Operations 등 AWS 네이티브 서비스를 조합하여 다음을 달성하는 데이터 보호 아키텍처를 구축했습니다:
-
-1. **랜섬웨어 방어**: 공격자가 데이터를 덮어써도 Object Versioning이 원본을 보존; IAM deny 정책이 버전 삭제 차단
-2. **계정 탈취 생존**: Cross-account 격리와 Compliance 모드 Object Lock으로 root도 백업 복사본 삭제 불가
-3. **실수 방지**: Versioning + IAM deny 정책으로 다중 안전망 구성 (AWS Organizations가 있다면 SCP로 추가 강화 가능)
-4. **시점 복구 지원**: S3 Metadata journal 테이블이 near real-time으로 모든 변경을 추적하고, Athena로 SQL 검색하며, S3 Batch Operations로 대규모 복원
-
-AWS Backup for S3가 가장 기능이 풍부하고 운영이 간편한 옵션이지만, 이 아키텍처는 대규모 환경에서 AWS Backup 비용이 부담될 때 최소한의 비용으로 필수적인 데이터 보호를 제공합니다. Destination은 Glacier Deep Archive를 사용하여 스토리지 비용을 극대화하며, 전체 규모 DR에는 Bulk 검색(48시간), 개별 복원에는 Standard 검색(12시간)을 활용합니다.
-
-핵심 인사이트: **보호 계층(복제 + 잠금)과 복구 계층(메타데이터 + 쿼리 + 배치 복원)을 분리**하는 것입니다. 보호 계층은 저비용으로 지속 운영되고, 복구 계층은 대부분 휴면 상태입니다 — S3 Metadata journal 비용은 실제 변경량에 비례하며, 비용이 큰 작업(Athena 쿼리, Batch Operations)은 실제 복구가 필요할 때만 실행됩니다.
+| Phase | Actions | Timeline | Cost Impact |
+|-------|---------|----------|-------------|
+| **Immediate** | Enable Versioning, IAM deny policies for versioning protection | Day 1 | $0 |
+| **Week 1** | Create Account B, configure destination bucket with Object Lock | Week 1 | $0 until replication starts |
+| **Week 2** | Set up cross-account SRR, enable S3 Metadata on both accounts | Week 2 | ~$600/mo begins |
+| **Week 3** | Run Batch Replication for existing objects, create Athena tables | Week 3 | One-time replication request costs |
+| **Week 4** | Test PITR restore (partial), document runbook, enable GuardDuty | Week 4 | ~$15 for test restore |
 
 ---
 
-*저자 소개: 이 아키텍처는 관리형 백업 서비스 비용이 부담되는 대규모 S3 환경에서 기본적인 데이터 보호가 필요한 조직을 위해 설계되었습니다.*
+## Final Monthly Cost Summary
+
+| Component | Monthly Cost |
+|-----------|-------------|
+| Destination storage (Deep Archive, 500 TB) | $495 |
+| S3 Metadata journal — Account A (~0.1–1% daily churn) | $5–45 |
+| S3 Metadata journal — Account B (~0.1–1% daily churn) | $5–45 |
+| S3 Metadata live inventory (< 1B objects) | $0 |
+| Data transfer (same-region SRR) | $0 |
+| Object Lock / Versioning / IAM deny policies | $0 |
+| CloudTrail (management events) + GuardDuty | ~$10 |
+| **Total additional cost** | **~$515–595/mo** |
+
+---
+
+## Conclusion
+
+By combining native AWS services — S3 Versioning, Cross-Account Same-Region Replication, Object Lock (Compliance mode), IAM deny policies, S3 Metadata, Athena, and S3 Batch Operations — we built a data protection architecture that:
+
+1. **Defends against ransomware**: Object versioning preserves originals even when attackers overwrite data; IAM deny policies prevent version deletion
+2. **Survives account takeover**: Cross-account isolation with Compliance mode Object Lock means even root cannot delete backup copies
+3. **Prevents accidental damage**: Versioning + IAM deny policies create multiple safety nets (optionally strengthened with SCPs via AWS Organizations)
+4. **Enables point-in-time recovery**: S3 Metadata journal tables provide near real-time, SQL-queryable change history to identify exact versions at any timestamp, and S3 Batch Operations restores them at scale
+
+While AWS Backup for S3 remains the most feature-rich and operationally simple option, this architecture provides essential data protection at a fraction of the cost — ideal for organizations where AWS Backup pricing is prohibitive at scale. The destination uses Glacier Deep Archive for maximum storage savings, with Bulk retrieval (48 hours) for full-scale DR or Standard retrieval (12 hours) for targeted restores.
+
+The key insight: **separate the protection layer (replication + locks) from the recovery layer (metadata + query + batch restore)**. The protection layer runs continuously at low cost. The recovery layer is mostly dormant — S3 Metadata journal costs scale with actual change volume, and the expensive operations (Athena queries, Batch Operations) only run when you actually need to recover.
+
+---
+
+*About the author: This architecture was designed for organizations managing large-scale S3 environments that need baseline data protection when managed backup service costs are prohibitive.*
